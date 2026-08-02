@@ -11,6 +11,9 @@ mod autolearn;
 mod hotkey;
 mod local_llm;
 mod paste;
+mod insights;
+mod services;
+mod transforms;
 #[cfg(target_os = "windows")]
 mod win;
 
@@ -99,8 +102,10 @@ fn get_settings() -> whimpr_core::Settings {
 }
 
 #[tauri::command]
-fn set_settings(settings: whimpr_core::Settings) {
+fn set_settings(app: tauri::AppHandle, settings: whimpr_core::Settings) {
+    let launch = settings.launch_at_login;
     hotkey::update_settings(settings);
+    sync_launch_at_login(&app, launch);
 }
 
 /// Aggregated dictation stats for the Hub dashboard. `tz_offset_minutes` is the
@@ -228,8 +233,146 @@ fn set_api_key(provider: String, key: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn delete_history(ts_unix: u64) -> bool {
+    hotkey::delete_history(ts_unix)
+}
+
+#[tauri::command]
+fn analyze_insights(force_refresh: bool) -> insights::InsightReport {
+    let settings = hotkey::current_settings();
+    let sessions = hotkey::sessions_for_analysis(50);
+    insights::analyze(
+        &sessions,
+        &settings.ollama_base_url,
+        &settings.ollama_model,
+        force_refresh,
+    )
+}
+
+#[tauri::command]
+fn get_language_stats() -> whimpr_core::LanguageStats {
+    hotkey::language_stats(100)
+}
+
+#[tauri::command]
+fn get_snippets() -> Vec<whimpr_core::Snippet> {
+    hotkey::snippets_list()
+}
+
+#[tauri::command]
+fn add_snippet(trigger: String, expansion: String) {
+    hotkey::snippet_add(trigger, expansion);
+}
+
+#[tauri::command]
+fn remove_snippet(trigger: String) -> bool {
+    hotkey::snippet_remove(&trigger)
+}
+
+#[tauri::command]
+fn get_transforms() -> Vec<whimpr_core::TransformPreset> {
+    hotkey::transforms_list()
+}
+
+#[tauri::command]
+fn save_transform(preset: whimpr_core::TransformPreset) {
+    hotkey::transform_upsert(preset);
+}
+
+#[tauri::command]
+fn remove_transform(id: String) -> bool {
+    hotkey::transform_remove(&id)
+}
+
+#[tauri::command]
+fn run_transform(preset_id: String, instruction: Option<String>) -> Result<String, String> {
+    let settings = hotkey::current_settings();
+    let selected = crate::paste::copy_selection()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            "No text selected — highlight text in another app, then run the transform.".to_string()
+        })?;
+
+    let instruction = if let Some(custom) = instruction.filter(|s| !s.trim().is_empty()) {
+        custom
+    } else {
+        hotkey::transforms_list()
+            .into_iter()
+            .find(|p| p.id == preset_id)
+            .map(|p| p.instruction)
+            .ok_or_else(|| format!("Unknown transform preset: {preset_id}"))?
+    };
+
+    let out = transforms::apply_via_ollama(
+        &selected,
+        &instruction,
+        &settings.ollama_base_url,
+        &settings.ollama_model,
+    )?;
+    crate::paste::paste_text(&out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+#[tauri::command]
+fn get_hotkey_presets() -> Vec<(String, String)> {
+    whimpr_core::HOTKEY_PRESETS
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[tauri::command]
+fn get_services() -> services::ServicesStatus {
+    services::status(hotkey::asr_ready())
+}
+
+#[tauri::command]
+fn start_ollama() -> Result<(), String> {
+    services::start_ollama()
+}
+
+#[tauri::command]
+fn pull_ollama_model(model: String) -> Result<(), String> {
+    services::pull_ollama_model(&model)
+}
+
+fn sync_launch_at_login(app: &tauri::AppHandle, enabled: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    let result = if enabled {
+        autolaunch.enable()
+    } else {
+        autolaunch.disable()
+    };
+    if let Err(e) = result {
+        eprintln!("[whimpr] launch-at-login sync failed: {e}");
+    }
+}
+
+#[tauri::command]
+fn set_launch_at_login(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    if enabled {
+        app.autolaunch().enable().map_err(|e| e.to_string())?;
+    } else {
+        app.autolaunch().disable().map_err(|e| e.to_string())?;
+    }
+    let mut settings = hotkey::current_settings();
+    settings.launch_at_login = enabled;
+    hotkey::update_settings(settings);
+    Ok(())
+}
+
+#[tauri::command]
+fn is_launch_at_login_enabled(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,
@@ -239,6 +382,22 @@ pub fn run() {
             add_dictionary_entry,
             remove_dictionary_entry,
             get_status,
+            get_services,
+            start_ollama,
+            pull_ollama_model,
+            set_launch_at_login,
+            is_launch_at_login_enabled,
+            delete_history,
+            analyze_insights,
+            get_language_stats,
+            get_snippets,
+            add_snippet,
+            remove_snippet,
+            get_transforms,
+            save_transform,
+            remove_transform,
+            run_transform,
+            get_hotkey_presets,
             request_microphone,
             request_accessibility,
             request_input_monitoring,
@@ -257,6 +416,12 @@ pub fn run() {
 
             // Wire the Fn key to the pill via the real state machine.
             hotkey::install(app.handle().clone());
+
+            // Honor saved launch-at-login preference.
+            let settings = hotkey::current_settings();
+            if settings.launch_at_login {
+                sync_launch_at_login(app.handle(), true);
+            }
 
             let open = MenuItem::with_id(app, "open", "Open WhimprFlow", true, None::<&str>)?;
             let demo_rec =

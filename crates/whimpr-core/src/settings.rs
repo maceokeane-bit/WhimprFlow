@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::cleanup::CleanupLevel;
+use crate::style::WritingStyle;
 
 /// Which cleanup engine processes transcripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -13,10 +14,12 @@ use crate::cleanup::CleanupLevel;
 pub enum CleanupMode {
     /// Paste the raw transcript (no cleanup).
     Raw,
-    /// Local on-device model (default — works offline, no API key).
-    #[default]
+    /// Local on-device GGUF worker (offline backup when Ollama is down).
     Local,
-    /// OpenAI cloud.
+    /// Ollama on this machine (`http://localhost:11434`, OpenAI-compatible API).
+    #[default]
+    Ollama,
+    /// OpenAI cloud (or any OpenAI-compatible API — DeepSeek, OpenRouter, etc.).
     OpenAi,
     /// Anthropic cloud.
     Anthropic,
@@ -34,8 +37,34 @@ pub struct Settings {
     #[serde(default)]
     pub openai_base_url: String,
     pub anthropic_model: String,
+    /// Ollama API root, e.g. `http://localhost:11434/v1`.
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
+    /// Ollama model tag, e.g. `qwen3:8b`.
+    #[serde(default = "default_ollama_model")]
+    pub ollama_model: String,
+    /// Optional GGUF filename under `models/` for Local mode (blank = auto-detect).
+    #[serde(default)]
+    pub local_model: String,
+    /// Start WhimprFlow automatically when you log in to macOS.
+    #[serde(default)]
+    pub launch_at_login: bool,
+    /// Push-to-talk hotkey, e.g. `option+w` or `fn`. Configured in-app (Accessibility required).
+    #[serde(default = "crate::hotkey_binding::default_ptt_hotkey")]
+    pub ptt_hotkey: String,
+    /// Personalized caps/punctuation tone layered on cleanup.
+    #[serde(default)]
+    pub writing_style: WritingStyle,
     /// Play the record-start ping.
     pub sound_on_start: bool,
+}
+
+fn default_ollama_base_url() -> String {
+    "http://localhost:11434/v1".to_string()
+}
+
+fn default_ollama_model() -> String {
+    "qwen3:1.7b".to_string()
 }
 
 impl Default for Settings {
@@ -46,6 +75,12 @@ impl Default for Settings {
             openai_model: "gpt-4o-mini".to_string(),
             openai_base_url: String::new(),
             anthropic_model: "claude-haiku-4-5".to_string(),
+            ollama_base_url: default_ollama_base_url(),
+            ollama_model: default_ollama_model(),
+            local_model: String::new(),
+            launch_at_login: false,
+            ptt_hotkey: crate::hotkey_binding::default_ptt_hotkey(),
+            writing_style: WritingStyle::default(),
             sound_on_start: true,
         }
     }
@@ -74,7 +109,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.cleanup_mode, CleanupMode::Local);
+        assert_eq!(s.cleanup_mode, CleanupMode::Ollama);
         assert_eq!(s.cleanup_level, CleanupLevel::Light);
     }
 

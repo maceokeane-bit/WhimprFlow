@@ -82,13 +82,19 @@ mod imp {
     const K_CG_SESSION_EVENT_TAP: u32 = 1;
     const K_CG_HEAD_INSERT: u32 = 0;
     const K_CG_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+    const K_CG_EVENT_KEY_DOWN: u32 = 10;
+    const K_CG_EVENT_KEY_UP: u32 = 11;
     const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
-    const EVENTS_OF_INTEREST: u64 = 1 << K_CG_EVENT_FLAGS_CHANGED;
+    const EVENTS_OF_INTEREST: u64 =
+        (1 << K_CG_EVENT_KEY_DOWN) | (1 << K_CG_EVENT_KEY_UP) | (1 << K_CG_EVENT_FLAGS_CHANGED);
     const FLAG_SECONDARY_FN: u64 = 0x0080_0000;
     const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
     const KEYCODE_FN: i64 = 63;
+    const KEYCODE_ESC: i64 = 53;
     const K_CG_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
     const K_CG_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+
+    static PTT_HELD: AtomicBool = AtomicBool::new(false);
 
     static APP: OnceLock<AppHandle> = OnceLock::new();
     static MACHINE: OnceLock<Mutex<StateMachine>> = OnceLock::new();
@@ -101,15 +107,20 @@ mod imp {
     static CAPTURE: OnceLock<Mutex<Option<whimpr_audio::CaptureHandle>>> = OnceLock::new();
     static ASR: OnceLock<Arc<whimpr_asr::WhisperEngine>> = OnceLock::new();
     static OPENAI: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
+    static OLLAMA: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
     static ANTHROPIC: OnceLock<Mutex<Option<whimpr_cleanup::AnthropicProvider>>> = OnceLock::new();
     static LOCAL: OnceLock<Mutex<Option<crate::local_llm::LocalWorker>>> = OnceLock::new();
     static SETTINGS: OnceLock<Mutex<whimpr_core::Settings>> = OnceLock::new();
     static DICTIONARY: OnceLock<Mutex<whimpr_core::DictionaryStore>> = OnceLock::new();
+    static SNIPPETS: OnceLock<Mutex<whimpr_core::SnippetStore>> = OnceLock::new();
+    static TRANSFORMS: OnceLock<Mutex<whimpr_core::TransformStore>> = OnceLock::new();
     static STATS: OnceLock<Mutex<whimpr_core::StatsStore>> = OnceLock::new();
 
     #[derive(Clone, Serialize)]
     struct BarPayload {
         state: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     }
 
     #[derive(Clone, Serialize)]
@@ -152,6 +163,12 @@ mod imp {
     fn dict_path() -> PathBuf {
         support_dir().join("dictionary.json")
     }
+    fn snippets_path() -> PathBuf {
+        support_dir().join("snippets.json")
+    }
+    fn transforms_path() -> PathBuf {
+        support_dir().join("transforms.json")
+    }
     fn stats_path() -> PathBuf {
         support_dir().join("stats.json")
     }
@@ -166,8 +183,8 @@ mod imp {
 
     /// Log one completed dictation to the stats store (words, speaking time, text,
     /// target app) and persist it. Powers both the Hub stats and the history list.
-    pub fn record_dictation(text: &str, duration_secs: f32) {
-        let words = whimpr_core::stats::count_words(text);
+    pub fn record_dictation(raw: &str, cleaned: &str, duration_secs: f32) {
+        let words = whimpr_core::stats::count_words(cleaned);
         if words == 0 {
             return;
         }
@@ -175,8 +192,16 @@ mod imp {
         if let Some(m) = STATS.get() {
             let mut store = m.lock().unwrap();
             let duration_ms = (duration_secs.max(0.0) * 1000.0) as u32;
-            let chars = text.chars().count() as u32;
-            store.record(words, duration_ms, chars, unix_now(), text.to_string(), app);
+            let chars = cleaned.chars().count() as u32;
+            store.record(
+                words,
+                duration_ms,
+                chars,
+                unix_now(),
+                cleaned.to_string(),
+                raw.to_string(),
+                app,
+            );
             let _ = store.save(&stats_path());
         }
     }
@@ -186,6 +211,35 @@ mod imp {
         STATS
             .get()
             .map(|m| m.lock().unwrap().history(limit))
+            .unwrap_or_default()
+    }
+
+    pub fn delete_history(ts_unix: u64) -> bool {
+        let Some(m) = STATS.get() else {
+            return false;
+        };
+        let mut store = m.lock().unwrap();
+        let ok = store.delete_at(ts_unix);
+        if ok {
+            let _ = store.save(&stats_path());
+        }
+        ok
+    }
+
+    pub fn sessions_for_analysis(limit: usize) -> Vec<(String, Option<String>)> {
+        STATS
+            .get()
+            .map(|m| {
+                m.lock()
+                    .unwrap()
+                    .sessions
+                    .iter()
+                    .rev()
+                    .filter(|s| !s.text.is_empty())
+                    .take(limit)
+                    .map(|s| (s.text.clone(), s.app.clone()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -235,6 +289,67 @@ mod imp {
             store.add(correct, mishears, whimpr_core::DictSource::Auto);
             let _ = store.save(&dict_path());
         }
+    }
+
+    pub fn snippets_list() -> Vec<whimpr_core::Snippet> {
+        SNIPPETS
+            .get()
+            .map(|m| m.lock().unwrap().snippets.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn snippet_add(trigger: String, expansion: String) {
+        if let Some(m) = SNIPPETS.get() {
+            let mut store = m.lock().unwrap();
+            store.add(trigger, expansion);
+            let _ = store.save(&snippets_path());
+        }
+    }
+
+    pub fn snippet_remove(trigger: &str) -> bool {
+        let Some(m) = SNIPPETS.get() else {
+            return false;
+        };
+        let mut store = m.lock().unwrap();
+        let ok = store.remove(trigger);
+        if ok {
+            let _ = store.save(&snippets_path());
+        }
+        ok
+    }
+
+    pub fn transforms_list() -> Vec<whimpr_core::TransformPreset> {
+        TRANSFORMS
+            .get()
+            .map(|m| m.lock().unwrap().presets.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn transform_upsert(preset: whimpr_core::TransformPreset) {
+        if let Some(m) = TRANSFORMS.get() {
+            let mut store = m.lock().unwrap();
+            store.upsert(preset);
+            let _ = store.save(&transforms_path());
+        }
+    }
+
+    pub fn transform_remove(id: &str) -> bool {
+        let Some(m) = TRANSFORMS.get() else {
+            return false;
+        };
+        let mut store = m.lock().unwrap();
+        let ok = store.remove(id);
+        if ok {
+            let _ = store.save(&transforms_path());
+        }
+        ok
+    }
+
+    pub fn language_stats(limit: usize) -> whimpr_core::LanguageStats {
+        STATS
+            .get()
+            .map(|m| m.lock().unwrap().language_stats(limit))
+            .unwrap_or_default()
     }
 
     /// Aggregated stats for the Hub. `tz_offset_minutes` is the UI's
@@ -296,17 +411,34 @@ mod imp {
                 Some(settings.openai_base_url.clone()),
             )
         });
+        let ollama_base = if settings.ollama_base_url.trim().is_empty() {
+            "http://localhost:11434/v1".to_string()
+        } else {
+            settings.ollama_base_url.clone()
+        };
+        let ollama = Some(whimpr_cleanup::OpenAiProvider::with_base_url(
+            String::new(),
+            settings.ollama_model.clone(),
+            Some(ollama_base),
+        ));
         let anthropic = read_anthropic_key()
             .map(|k| whimpr_cleanup::AnthropicProvider::new(k, settings.anthropic_model.clone()));
         eprintln!(
-            "[whimpr] cleanup providers: openai={}, anthropic={}",
+            "[whimpr] cleanup providers: openai={}, ollama={}, anthropic={}",
             openai.is_some(),
+            ollama.is_some(),
             anthropic.is_some()
         );
         match OPENAI.get() {
             Some(m) => *m.lock().unwrap() = openai,
             None => {
                 let _ = OPENAI.set(Mutex::new(openai));
+            }
+        }
+        match OLLAMA.get() {
+            Some(m) => *m.lock().unwrap() = ollama,
+            None => {
+                let _ = OLLAMA.set(Mutex::new(ollama));
             }
         }
         match ANTHROPIC.get() {
@@ -346,6 +478,7 @@ mod imp {
             level,
             vocab,
             app_bundle_id,
+            writing_style: settings.writing_style,
             ..Default::default()
         };
         // Run the on-device model with the same prompt + per-app formatting.
@@ -364,6 +497,10 @@ mod imp {
         // (so cleanup still runs) — and Local mode uses the worker directly.
         let result: Option<anyhow::Result<String>> = match settings.cleanup_mode {
             CleanupMode::OpenAi => OPENAI
+                .get()
+                .and_then(|m| m.lock().unwrap().as_ref().map(|p| p.cleanup(raw, &ctx)))
+                .or_else(run_local),
+            CleanupMode::Ollama => OLLAMA
                 .get()
                 .and_then(|m| m.lock().unwrap().as_ref().map(|p| p.cleanup(raw, &ctx)))
                 .or_else(run_local),
@@ -393,7 +530,11 @@ mod imp {
             }
             None => {
                 if matches!(settings.cleanup_mode, CleanupMode::Local) {
-                    eprintln!("[whimpr] local cleanup model not wired yet — pasting raw");
+                    eprintln!("[whimpr] local cleanup worker unavailable — pasting raw");
+                } else if matches!(settings.cleanup_mode, CleanupMode::Ollama) {
+                    eprintln!(
+                        "[whimpr] Ollama unavailable — is it running? (`ollama serve`) — pasting raw"
+                    );
                 } else {
                     eprintln!("[whimpr] cleanup provider has no API key — pasting raw");
                 }
@@ -419,8 +560,16 @@ mod imp {
     }
 
     fn emit_bar(app: &AppHandle, state: &'static str) {
+        emit_bar_msg(app, state, None);
+    }
+
+    fn emit_bar_msg(app: &AppHandle, state: &'static str, message: Option<String>) {
         eprintln!("[whimpr] pill -> {state}");
-        let _ = app.emit_to(OVERLAY_LABEL, "whimpr://flowbar/state", BarPayload { state });
+        let _ = app.emit_to(
+            OVERLAY_LABEL,
+            "whimpr://flowbar/state",
+            BarPayload { state, message },
+        );
     }
 
     /// Feed one input into the shared state machine and enact its actions.
@@ -506,7 +655,13 @@ mod imp {
                     let pcm = whimpr_audio::resample_to_16k(&res.samples, res.sample_rate);
                     match asr.transcribe(&pcm) {
                         Ok(t) => {
-                            let raw = t.text;
+                            let mut raw = t.text;
+                            if let Some(m) = SNIPPETS.get() {
+                                if let Some(expanded) = m.lock().unwrap().expand(&raw) {
+                                    eprintln!("[whimpr] snippet trigger matched — expanding");
+                                    raw = expanded;
+                                }
+                            }
                             eprintln!("[whimpr] TRANSCRIPT: \"{}\"", raw);
                             // Clean the transcript (cloud LLM if configured), then paste.
                             let text = clean_transcript(&raw);
@@ -516,11 +671,15 @@ mod imp {
                             if !text.is_empty() {
                                 if let Err(e) = crate::paste::paste_text(&text) {
                                     eprintln!("[whimpr] paste failed: {e}");
+                                    emit_bar_msg(
+                                        &app2,
+                                        "error",
+                                        Some("Couldn't paste — check Accessibility".into()),
+                                    );
+                                } else {
+                                    record_dictation(&raw, &text, res.duration_secs());
+                                    crate::autolearn::watch_correction(&text);
                                 }
-                                // Log words + speaking time for the Hub stats (WPM, streak…).
-                                record_dictation(&text, res.duration_secs());
-                                // Watch the field for a post-paste correction to learn (✨).
-                                crate::autolearn::watch_correction(&text);
                             }
                             let _ = app2.emit_to(
                                 OVERLAY_LABEL,
@@ -528,7 +687,10 @@ mod imp {
                                 TranscriptPayload { text },
                             );
                         }
-                        Err(e) => eprintln!("[whimpr] ASR error: {e}"),
+                        Err(e) => {
+                            eprintln!("[whimpr] ASR error: {e}");
+                            emit_bar_msg(&app2, "error", Some("Transcription failed".into()));
+                        }
                     }
                     finish();
                 });
@@ -547,6 +709,35 @@ mod imp {
         }
     }
 
+    fn current_binding() -> whimpr_core::HotkeyBinding {
+        let raw = current_settings().ptt_hotkey;
+        whimpr_core::parse_hotkey(&raw).unwrap_or_default()
+    }
+
+    fn ptt_down(at_ms: u64) {
+        if PTT_HELD.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        eprintln!("[whimpr] PTT DOWN");
+        let target = crate::appctx::frontmost_bundle_id();
+        *TARGET_APP.get_or_init(|| Mutex::new(None)).lock().unwrap() = target;
+        handle_input(Input::Trigger(TriggerToken::Down {
+            binding: BindingId::PushToTalk,
+            at_ms,
+        }));
+    }
+
+    fn ptt_up(at_ms: u64) {
+        if !PTT_HELD.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        eprintln!("[whimpr] PTT UP");
+        handle_input(Input::Trigger(TriggerToken::Up {
+            binding: BindingId::PushToTalk,
+            at_ms,
+        }));
+    }
+
     extern "C" fn tap_callback(
         _proxy: CGEventTapProxy,
         etype: u32,
@@ -560,32 +751,56 @@ mod imp {
             }
             return event;
         }
-        if etype == K_CG_EVENT_FLAGS_CHANGED {
-            let keycode =
-                unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
-            if keycode == KEYCODE_FN {
-                let flags = unsafe { CGEventGetFlags(event) };
+
+        let binding = current_binding();
+        let at_ms = now_ms();
+        let keycode =
+            unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
+        let flags = unsafe { CGEventGetFlags(event) };
+
+        // Esc cancels from any state.
+        if etype == K_CG_EVENT_KEY_DOWN && keycode == KEYCODE_ESC {
+            ptt_up(at_ms);
+            handle_input(Input::Trigger(TriggerToken::Cancel { at_ms }));
+            return event;
+        }
+
+        if binding.is_fn {
+            if etype == K_CG_EVENT_FLAGS_CHANGED && keycode == KEYCODE_FN {
                 let down = (flags & FLAG_SECONDARY_FN) != 0;
-                let was_down = FN_IS_DOWN.swap(down, Ordering::SeqCst);
-                let at_ms = now_ms();
-                if down && !was_down {
-                    eprintln!("[whimpr] Fn DOWN");
-                    // Snapshot the paste target now, while the user's app is focused.
-                    let target = crate::appctx::frontmost_bundle_id();
-                    *TARGET_APP.get_or_init(|| Mutex::new(None)).lock().unwrap() = target;
-                    handle_input(Input::Trigger(TriggerToken::Down {
-                        binding: BindingId::PushToTalk,
-                        at_ms,
-                    }));
-                } else if !down && was_down {
-                    eprintln!("[whimpr] Fn UP");
-                    handle_input(Input::Trigger(TriggerToken::Up {
-                        binding: BindingId::PushToTalk,
-                        at_ms,
-                    }));
+                if down {
+                    ptt_down(at_ms);
+                } else {
+                    ptt_up(at_ms);
                 }
             }
+            return event;
         }
+
+        // Modifier-only hold (e.g. right-option).
+        if binding.modifiers == 0 && binding.keycode == keycode as u32 {
+            if etype == K_CG_EVENT_FLAGS_CHANGED {
+                let down = (flags & whimpr_core::hotkey_binding::flags::ALT) != 0
+                    || (flags & whimpr_core::hotkey_binding::flags::CONTROL) != 0;
+                if down {
+                    ptt_down(at_ms);
+                } else {
+                    ptt_up(at_ms);
+                }
+            }
+            return event;
+        }
+
+        // Key + modifier combo (e.g. option+w).
+        if keycode == binding.keycode as i64 {
+            let mods_ok = whimpr_core::hotkey_binding::modifiers_match(binding.modifiers, flags);
+            if etype == K_CG_EVENT_KEY_DOWN && mods_ok {
+                ptt_down(at_ms);
+            } else if etype == K_CG_EVENT_KEY_UP {
+                ptt_up(at_ms);
+            }
+        }
+
         event
     }
 
@@ -613,12 +828,16 @@ mod imp {
         // Load settings + dictionary, and build cloud providers from stored keys.
         let settings = whimpr_core::Settings::load(&settings_path());
         let dict = whimpr_core::DictionaryStore::load(&dict_path());
+        let snippets = whimpr_core::SnippetStore::load(&snippets_path());
+        let transforms = whimpr_core::TransformStore::load(&transforms_path());
         eprintln!(
             "[whimpr] cleanup mode: {:?}, level: {:?}",
             settings.cleanup_mode, settings.cleanup_level
         );
         let _ = SETTINGS.set(Mutex::new(settings));
         let _ = DICTIONARY.set(Mutex::new(dict));
+        let _ = SNIPPETS.set(Mutex::new(snippets));
+        let _ = TRANSFORMS.set(Mutex::new(transforms));
         let _ = STATS.set(Mutex::new(whimpr_core::StatsStore::load(&stats_path())));
         rebuild_providers();
 
@@ -692,25 +911,36 @@ mod imp {
             }
         });
     }
+
+    /// True once the Whisper model is loaded into memory.
+    pub fn asr_ready() -> bool {
+        ASR.get().is_some()
+    }
 }
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    current_settings, dictionary_add, dictionary_entries, dictionary_learn, dictionary_remove,
-    history, install, rebuild_providers, stats_summary, update_settings,
+    asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
+    dictionary_learn, dictionary_remove, history, install, language_stats, rebuild_providers,
+    sessions_for_analysis, snippet_add, snippet_remove, snippets_list, stats_summary,
+    transform_remove, transform_upsert, transforms_list, update_settings,
 };
 
 // Windows uses the real (but unverified) platform layer in `crate::win`.
 #[cfg(target_os = "windows")]
 pub use crate::win::{
-    current_settings, dictionary_add, dictionary_entries, dictionary_learn, dictionary_remove,
-    history, install, rebuild_providers, stats_summary, update_settings,
+    asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
+    dictionary_learn, dictionary_remove, history, install, rebuild_providers,
+    sessions_for_analysis, stats_summary, update_settings,
 };
 
 // Other platforms (Linux, etc.): inert stubs so the crate still builds.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod other {
     pub fn install(_app: tauri::AppHandle) {}
+    pub fn asr_ready() -> bool {
+        false
+    }
     pub fn current_settings() -> whimpr_core::Settings {
         whimpr_core::Settings::default()
     }
@@ -725,12 +955,37 @@ mod other {
     pub fn dictionary_entries() -> Vec<super::DictEntryDto> {
         Vec::new()
     }
+    pub fn delete_history(_ts_unix: u64) -> bool {
+        false
+    }
+    pub fn sessions_for_analysis(_limit: usize) -> Vec<(String, Option<String>)> {
+        Vec::new()
+    }
+    pub fn snippets_list() -> Vec<whimpr_core::Snippet> {
+        Vec::new()
+    }
+    pub fn snippet_add(_trigger: String, _expansion: String) {}
+    pub fn snippet_remove(_trigger: &str) -> bool {
+        false
+    }
+    pub fn transforms_list() -> Vec<whimpr_core::TransformPreset> {
+        Vec::new()
+    }
+    pub fn transform_upsert(_preset: whimpr_core::TransformPreset) {}
+    pub fn transform_remove(_id: &str) -> bool {
+        false
+    }
+    pub fn language_stats(_limit: usize) -> whimpr_core::LanguageStats {
+        whimpr_core::LanguageStats::default()
+    }
     pub fn dictionary_add(_correct: String, _mishears: Vec<String>) {}
     pub fn dictionary_remove(_correct: &str) {}
     pub fn dictionary_learn(_correct: String, _mishears: Vec<String>) {}
 }
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use other::{
-    current_settings, dictionary_add, dictionary_entries, dictionary_learn, dictionary_remove,
-    history, install, rebuild_providers, stats_summary, update_settings,
+    asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
+    dictionary_learn, dictionary_remove, history, install, language_stats, rebuild_providers,
+    sessions_for_analysis, snippet_add, snippet_remove, snippets_list, stats_summary,
+    transform_remove, transform_upsert, transforms_list, update_settings,
 };

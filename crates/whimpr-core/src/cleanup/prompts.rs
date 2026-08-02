@@ -179,14 +179,22 @@ pub fn format_mode_for_app(bundle_id: &str) -> Option<&'static str> {
     }
 }
 
-/// Assemble the final system prompt: the shared prompt, the level modifier, and
-/// (when the paste target is known) the per-app Formatting Mode.
-pub fn system_for(level: super::levels::CleanupLevel, app_bundle_id: Option<&str>) -> String {
+/// Assemble the final system prompt: the shared prompt, the level modifier, optional
+/// writing style, and (when the paste target is known) the per-app Formatting Mode.
+pub fn system_for(
+    level: super::levels::CleanupLevel,
+    app_bundle_id: Option<&str>,
+    writing_style: super::super::style::WritingStyle,
+) -> String {
     let mut s = SYSTEM_PROMPT.to_string();
     let modifier = level.modifier();
     if !modifier.is_empty() {
         s.push_str("\n\n");
         s.push_str(modifier);
+    }
+    if let Some(style_mod) = writing_style.modifier() {
+        s.push_str("\n\n");
+        s.push_str(style_mod);
     }
     if let Some(mode) = app_bundle_id.and_then(format_mode_for_app) {
         s.push_str("\n\n# Formatting Mode (follow this for structure and tone)\n");
@@ -197,5 +205,5 @@ pub fn system_for(level: super::levels::CleanupLevel, app_bundle_id: Option<&str
 
 /// Assemble the final system prompt for a level with no app adaptation.
 pub fn system_for_level(level: super::levels::CleanupLevel) -> String {
-    system_for(level, None)
+    system_for(level, None, super::super::style::WritingStyle::Default)
 }

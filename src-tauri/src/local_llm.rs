@@ -57,7 +57,7 @@ impl Drop for LocalWorker {
 
 /// Platform application-support dir: `~/Library/Application Support/WhimprFlow`
 /// on macOS, `%APPDATA%\WhimprFlow` on Windows.
-fn app_support_dir() -> PathBuf {
+pub fn app_support_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let base = std::env::var("APPDATA").unwrap_or_default();
@@ -70,7 +70,7 @@ fn app_support_dir() -> PathBuf {
     }
 }
 
-/// Find the worker binary: next to the app executable (bundled), else the dev build dir.
+/// Find the worker binary: next to the app executable (bundled), else common dev paths.
 pub fn worker_bin_path() -> Option<PathBuf> {
     let exe_name = if cfg!(target_os = "windows") {
         "whimpr-llm-worker.exe"
@@ -85,51 +85,88 @@ pub fn worker_bin_path() -> Option<PathBuf> {
             }
         }
     }
-    // Dev fallback.
-    #[cfg(target_os = "windows")]
-    {
-        let dev = std::env::current_dir()
-            .unwrap_or_default()
-            .join("target/release")
-            .join(exe_name);
-        return dev.exists().then_some(dev);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("target/release").join(exe_name));
+        candidates.push(cwd.join("target/debug").join(exe_name));
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let dev = PathBuf::from(home).join("WhimprFlow/target/release/whimpr-llm-worker");
-        dev.exists().then_some(dev)
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(
+            PathBuf::from(&home)
+                .join("Projects/WhimprFlow/target/release")
+                .join(exe_name),
+        );
+        candidates.push(
+            PathBuf::from(&home)
+                .join("WhimprFlow/target/release")
+                .join(exe_name),
+        );
     }
+    candidates.into_iter().find(|p| p.exists())
 }
 
-/// The local cleanup model path (same models dir as whisper/ASR). Prefer the
-/// larger, much more capable Qwen3-4B if present (far better at
-/// self-corrections and structure than the 1.5B); fall back to the 1.5B otherwise.
-pub fn model_path() -> PathBuf {
+/// Known-good GGUF filenames for cleanup, highest quality first.
+const PREFERRED_GGUF: &[&str] = &[
+    "qwen3-4b-instruct-2507-q4_k_m.gguf",
+    "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    "qwen3-8b-instruct-q4_k_m.gguf",
+    "Qwen3-8B-Instruct-Q4_K_M.gguf",
+    "qwen3-1.7b-instruct-q4_k_m.gguf",
+    "Qwen3-1.7B-Instruct-Q4_K_M.gguf",
+    "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+    "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+];
+
+/// Resolve the local cleanup GGUF: settings override → preferred names → any `.gguf` in `models/`.
+pub fn model_path() -> Option<PathBuf> {
     let dir = app_support_dir().join("models");
-    for name in [
-        "qwen3-4b-instruct-2507-q4_k_m.gguf",
-        "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-    ] {
+    let settings = whimpr_core::Settings::load(&app_support_dir().join("settings.json"));
+    if !settings.local_model.is_empty() {
+        let p = dir.join(&settings.local_model);
+        if p.exists() {
+            return Some(p);
+        }
+        eprintln!(
+            "[whimpr] local_model setting '{}' not found in {}",
+            settings.local_model,
+            dir.display()
+        );
+    }
+    for name in PREFERRED_GGUF {
         let p = dir.join(name);
         if p.exists() {
-            return p;
+            return Some(p);
         }
     }
-    dir.join("qwen2.5-1.5b-instruct-q4_k_m.gguf")
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut ggufs: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "gguf"))
+            .collect();
+        ggufs.sort();
+        if let Some(p) = ggufs.first() {
+            eprintln!(
+                "[whimpr] using auto-detected GGUF {}",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            );
+            return Some(p.clone());
+        }
+    }
+    None
 }
 
-/// Spawn the worker if both the binary and the model are present.
+/// Spawn the worker if both the binary and a GGUF model are present.
 pub fn spawn_default() -> Option<LocalWorker> {
     let bin = worker_bin_path()?;
-    let model = model_path();
-    if !model.exists() {
-        eprintln!("[whimpr] local model not found at {}", model.display());
-        return None;
-    }
+    let model = model_path()?;
     match LocalWorker::spawn(&bin, &model) {
         Ok(w) => {
-            eprintln!("[whimpr] local LLM worker started ({})", bin.display());
+            eprintln!(
+                "[whimpr] local LLM worker started ({}, model={})",
+                bin.display(),
+                model.display()
+            );
             Some(w)
         }
         Err(e) => {

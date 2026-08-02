@@ -21,6 +21,7 @@ whimpr-cleanup = { path = "../crates/whimpr-cleanup" }
 keyring = "3"
 strsim = "0.11"
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-autostart = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

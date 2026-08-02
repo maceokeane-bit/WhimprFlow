@@ -8,6 +8,9 @@ import { Insights } from "./Insights";
 import { DictionaryPane } from "./DictionaryPane";
 import { SettingsPane } from "./SettingsPane";
 import { Help } from "./Help";
+import { SnippetsPane } from "./SnippetsPane";
+import { StylePane } from "./StylePane";
+import { TransformsPane } from "./TransformsPane";
 import { ComingSoon } from "./ComingSoon";
 import type { IconName } from "./icons";
 import {
@@ -21,21 +24,6 @@ import {
 
 // Placeholder screens that are routed but not yet built.
 const SOON: Partial<Record<Page, { icon: IconName; title: string; desc: string }>> = {
-  snippets: {
-    icon: "snippets",
-    title: "Snippets",
-    desc: "Save reusable phrases and expand them by voice — signatures, addresses, boilerplate.",
-  },
-  style: {
-    icon: "style",
-    title: "Style",
-    desc: "Tune WhimprFlow's tone and formatting so cleaned-up text always sounds like you.",
-  },
-  transforms: {
-    icon: "transforms",
-    title: "Transforms",
-    desc: "Turn a quick spoken thought into an email, a summary, or a to-do with one command.",
-  },
   scratchpad: {
     icon: "scratchpad",
     title: "Scratchpad",
@@ -90,6 +78,9 @@ export function App() {
           {page === "home" && <Home />}
           {page === "insights" && <Insights />}
           {page === "dictionary" && <DictionaryPane />}
+          {page === "snippets" && <SnippetsPane />}
+          {page === "style" && <StylePane settings={settings} onChange={update} />}
+          {page === "transforms" && <TransformsPane />}
           {page === "settings" && (
             <SettingsPane settings={settings} onChange={update} status={status} refresh={refresh} />
           )}

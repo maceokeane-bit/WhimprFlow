@@ -12,15 +12,23 @@
 pub mod asr;
 pub mod cleanup;
 pub mod dictionary;
+pub mod hotkey_binding;
 pub mod settings;
+pub mod snippets;
 pub mod state;
 pub mod stats;
+pub mod style;
+pub mod transforms;
 pub mod types;
 
 pub use asr::{AsrEngine, AsrEngineId, Transcript};
 pub use cleanup::{CleanupContext, CleanupLevel, CleanupProvider, ProviderId, VocabEntry};
 pub use dictionary::{DictSource, DictionaryEntry, DictionaryStore};
+pub use hotkey_binding::{parse_hotkey, HotkeyBinding, PRESETS as HOTKEY_PRESETS};
 pub use settings::{CleanupMode, Settings};
-pub use stats::{HistoryItem, SessionRecord, StatsStore, StatsSummary};
+pub use snippets::{Snippet, SnippetStore};
+pub use stats::{HistoryItem, LanguageStats, SessionRecord, StatsStore, StatsSummary};
+pub use style::WritingStyle;
+pub use transforms::{TransformPreset, TransformStore};
 pub use state::{Action, BarState, DictationState, Input, PipelineEvent, StateMachine, TriggerToken};
 pub use types::{RecordMode, SessionId};

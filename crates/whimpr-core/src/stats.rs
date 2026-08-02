@@ -33,6 +33,9 @@ pub struct SessionRecord {
     /// predate this field.
     #[serde(default)]
     pub text: String,
+    /// Raw ASR transcript before cleanup (for undo / compare).
+    #[serde(default)]
+    pub raw_text: String,
     /// Bundle id of the app the text was inserted into, if known.
     #[serde(default)]
     pub app: Option<String>,
@@ -43,6 +46,8 @@ pub struct SessionRecord {
 pub struct HistoryItem {
     pub ts_unix: u64,
     pub text: String,
+    #[serde(default)]
+    pub raw_text: String,
     pub app: Option<String>,
     pub words: u32,
 }
@@ -72,6 +77,21 @@ pub struct StatsSummary {
     pub time_saved_secs: f64,
     /// Words per local day, oldest first; index 6 is today, 0 is six days ago.
     pub last7_words: [u64; 7],
+}
+
+/// Local language metrics derived from stored dictations (no LLM required).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct LanguageStats {
+    pub sessions_analyzed: u32,
+    pub avg_words_per_session: f64,
+    pub avg_wpm: u32,
+    /// Share of sessions where cleanup changed the text (0.0–1.0).
+    pub cleanup_edit_rate: f32,
+    /// Rough filler-word rate in raw transcripts (per 100 words).
+    pub filler_per_100_words: f32,
+    pub avg_sentence_length: f32,
+    pub unique_word_ratio: f32,
+    pub top_apps: Vec<(String, u32)>,
 }
 
 /// Count whitespace-delimited words. Matches how the cleanup layer thinks of words.
@@ -117,9 +137,25 @@ impl StatsStore {
         chars: u32,
         ts_unix: u64,
         text: String,
+        raw_text: String,
         app: Option<String>,
     ) {
-        self.sessions.push(SessionRecord { ts_unix, words, duration_ms, chars, text, app });
+        self.sessions.push(SessionRecord {
+            ts_unix,
+            words,
+            duration_ms,
+            chars,
+            text,
+            raw_text,
+            app,
+        });
+    }
+
+    /// Remove one session by timestamp (for history delete).
+    pub fn delete_at(&mut self, ts_unix: u64) -> bool {
+        let before = self.sessions.len();
+        self.sessions.retain(|s| s.ts_unix != ts_unix);
+        self.sessions.len() < before
     }
 
     /// The most recent `limit` dictations, newest first, for the Home history list.
@@ -132,6 +168,7 @@ impl StatsStore {
             .map(|s| HistoryItem {
                 ts_unix: s.ts_unix,
                 text: s.text.clone(),
+                raw_text: s.raw_text.clone(),
                 app: s.app.clone(),
                 words: s.words,
             })
@@ -210,6 +247,97 @@ impl StatsStore {
             last7_words,
         }
     }
+
+    /// Compute language/complexity signals from recent sessions (no LLM required).
+    pub fn language_stats(&self, limit: usize) -> LanguageStats {
+        let recent: Vec<_> = self
+            .sessions
+            .iter()
+            .rev()
+            .filter(|s| !s.text.is_empty())
+            .take(limit)
+            .collect();
+
+        if recent.is_empty() {
+            return LanguageStats::default();
+        }
+
+        let n = recent.len() as f64;
+        let total_words: u64 = recent.iter().map(|s| s.words as u64).sum();
+        let total_secs: f64 = recent.iter().map(|s| s.duration_ms as f64 / 1000.0).sum();
+
+        let mut edited = 0u32;
+        let mut filler_hits = 0u32;
+        let mut raw_word_total = 0u32;
+        let mut sentence_count = 0u32;
+        let mut sentence_words = 0u32;
+        let mut unique: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut app_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+        const FILLERS: &[&str] = &[" um ", " uh ", " er ", " hmm ", " like ", " you know ", " i mean "];
+
+        for s in &recent {
+            if !s.raw_text.is_empty() && s.raw_text.trim() != s.text.trim() {
+                edited += 1;
+            }
+            let sample = if !s.raw_text.is_empty() {
+                s.raw_text.as_str()
+            } else {
+                s.text.as_str()
+            };
+            let padded = format!(" {} ", sample.to_ascii_lowercase());
+            for f in FILLERS {
+                filler_hits += padded.matches(f).count() as u32;
+            }
+            raw_word_total += count_words(sample);
+
+            for w in sample.split_whitespace() {
+                let w = w.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+                if w.len() > 2 {
+                    unique.insert(w);
+                }
+            }
+
+            for part in sample.split(['.', '!', '?']) {
+                let wc = count_words(part);
+                if wc > 0 {
+                    sentence_count += 1;
+                    sentence_words += wc;
+                }
+            }
+
+            if let Some(app) = &s.app {
+                *app_counts.entry(app.clone()).or_default() += 1;
+            }
+        }
+
+        let mut top_apps: Vec<(String, u32)> = app_counts.into_iter().collect();
+        top_apps.sort_by(|a, b| b.1.cmp(&a.1));
+        top_apps.truncate(5);
+
+        LanguageStats {
+            sessions_analyzed: recent.len() as u32,
+            avg_words_per_session: total_words as f64 / n,
+            avg_wpm: wpm(total_words, total_secs),
+            cleanup_edit_rate: edited as f32 / recent.len() as f32,
+            filler_per_100_words: if raw_word_total > 0 {
+                filler_hits as f32 / raw_word_total as f32 * 100.0
+            } else {
+                0.0
+            },
+            avg_sentence_length: if sentence_count > 0 {
+                sentence_words as f32 / sentence_count as f32
+            } else {
+                0.0
+            },
+            unique_word_ratio: if raw_word_total > 0 {
+                unique.len() as f32 / raw_word_total as f32
+            } else {
+                0.0
+            },
+            top_apps,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -230,9 +358,9 @@ mod tests {
     fn aggregates_totals_and_wpm() {
         let mut s = StatsStore::default();
         // 60 words in 60s -> 60 wpm.
-        s.record(60, 60_000, 300, NOW, String::new(), None);
+        s.record(60, 60_000, 300, NOW, String::new(), String::new(), None);
         // 30 words in 15s -> 120 wpm.
-        s.record(30, 15_000, 150, NOW, String::new(), None);
+        s.record(30, 15_000, 150, NOW, String::new(), String::new(), None);
         let sum = s.summary(0, NOW);
         assert_eq!(sum.total_words, 90);
         assert_eq!(sum.total_sessions, 2);
@@ -246,11 +374,11 @@ mod tests {
     fn streak_counts_consecutive_days_including_gap_today() {
         let mut s = StatsStore::default();
         // Activity yesterday, day-before, and three days ago (but NOT today).
-        s.record(10, 5_000, 50, NOW - DAY, String::new(), None);
-        s.record(10, 5_000, 50, NOW - 2 * DAY, String::new(), None);
-        s.record(10, 5_000, 50, NOW - 3 * DAY, String::new(), None);
+        s.record(10, 5_000, 50, NOW - DAY, String::new(), String::new(), None);
+        s.record(10, 5_000, 50, NOW - 2 * DAY, String::new(), String::new(), None);
+        s.record(10, 5_000, 50, NOW - 3 * DAY, String::new(), String::new(), None);
         // Gap at 4 days ago, then one more.
-        s.record(10, 5_000, 50, NOW - 5 * DAY, String::new(), None);
+        s.record(10, 5_000, 50, NOW - 5 * DAY, String::new(), String::new(), None);
         let sum = s.summary(0, NOW);
         // Today empty -> start at yesterday; 3 consecutive days back, then a gap.
         assert_eq!(sum.day_streak, 3);
@@ -260,8 +388,8 @@ mod tests {
     #[test]
     fn last7_buckets_by_local_day() {
         let mut s = StatsStore::default();
-        s.record(5, 3_000, 25, NOW, String::new(), None); // today
-        s.record(7, 3_000, 35, NOW - 2 * DAY, String::new(), None); // 2 days ago
+        s.record(5, 3_000, 25, NOW, String::new(), String::new(), None); // today
+        s.record(7, 3_000, 35, NOW - 2 * DAY, String::new(), String::new(), None); // 2 days ago
         let sum = s.summary(0, NOW);
         assert_eq!(sum.last7_words[6], 5); // today
         assert_eq!(sum.last7_words[4], 7); // two days ago

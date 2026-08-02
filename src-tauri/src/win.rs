@@ -45,6 +45,7 @@ static CAPTURE: OnceLock<Mutex<Option<whimpr_audio::CaptureHandle>>> = OnceLock:
 static ASR: OnceLock<Arc<whimpr_asr::WhisperEngine>> = OnceLock::new();
 static LOCAL: OnceLock<Mutex<Option<crate::local_llm::LocalWorker>>> = OnceLock::new();
 static OPENAI: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
+static OLLAMA: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
 static SETTINGS: OnceLock<Mutex<whimpr_core::Settings>> = OnceLock::new();
 static DICTIONARY: OnceLock<Mutex<whimpr_core::DictionaryStore>> = OnceLock::new();
 static STATS: OnceLock<Mutex<whimpr_core::StatsStore>> = OnceLock::new();
@@ -197,6 +198,10 @@ fn clean_transcript(raw: &str) -> String {
             .get()
             .and_then(|m| m.lock().unwrap().as_ref().map(|p| p.cleanup(&raw_norm, &ctx)))
             .or_else(run_local),
+        CleanupMode::Ollama => OLLAMA
+            .get()
+            .and_then(|m| m.lock().unwrap().as_ref().map(|p| p.cleanup(&raw_norm, &ctx)))
+            .or_else(run_local),
         CleanupMode::Local => run_local(),
         _ => run_local(),
     };
@@ -222,7 +227,15 @@ fn record_dictation(text: &str, duration_secs: f32, app: Option<String>) {
         let mut store = m.lock().unwrap();
         let duration_ms = (duration_secs.max(0.0) * 1000.0) as u32;
         let chars = text.chars().count() as u32;
-        store.record(words, duration_ms, chars, unix_now(), text.to_string(), app);
+        store.record(
+            words,
+            duration_ms,
+            chars,
+            unix_now(),
+            text.to_string(),
+            text.to_string(),
+            app,
+        );
         let _ = store.save(&stats_path());
     }
 }
@@ -311,6 +324,7 @@ pub fn install(app: AppHandle) {
     let _ = DICTIONARY.set(Mutex::new(whimpr_core::DictionaryStore::load(&dict_path())));
     let _ = STATS.set(Mutex::new(whimpr_core::StatsStore::load(&stats_path())));
     let _ = OPENAI.set(Mutex::new(None));
+    let _ = OLLAMA.set(Mutex::new(None));
     let _ = LOCAL.set(Mutex::new(None));
     rebuild_providers();
 
@@ -349,8 +363,8 @@ pub fn update_settings(new: whimpr_core::Settings) {
 
 pub fn rebuild_providers() {
     let settings = current_settings_inner();
-    let model = settings.openai_model;
-    let base_url = settings.openai_base_url;
+    let model = settings.openai_model.clone();
+    let base_url = settings.openai_base_url.clone();
     let key = keyring::Entry::new("com.whimpr.whimprflow", "openai_api_key")
         .ok()
         .and_then(|e| e.get_password().ok())
@@ -360,6 +374,22 @@ pub fn rebuild_providers() {
             whimpr_cleanup::OpenAiProvider::with_base_url(k, model, Some(base_url))
         });
     }
+    let ollama_base = if settings.ollama_base_url.trim().is_empty() {
+        "http://localhost:11434/v1".to_string()
+    } else {
+        settings.ollama_base_url.clone()
+    };
+    if let Some(slot) = OLLAMA.get() {
+        *slot.lock().unwrap() = Some(whimpr_cleanup::OpenAiProvider::with_base_url(
+            String::new(),
+            settings.ollama_model.clone(),
+            Some(ollama_base),
+        ));
+    }
+}
+
+pub fn asr_ready() -> bool {
+    ASR.get().is_some()
 }
 
 pub fn stats_summary(tz_offset_minutes: i32) -> StatsSummary {
@@ -371,6 +401,35 @@ pub fn stats_summary(tz_offset_minutes: i32) -> StatsSummary {
 
 pub fn history(limit: usize) -> Vec<whimpr_core::HistoryItem> {
     STATS.get().map(|m| m.lock().unwrap().history(limit)).unwrap_or_default()
+}
+
+pub fn delete_history(ts_unix: u64) -> bool {
+    let Some(m) = STATS.get() else {
+        return false;
+    };
+    let mut store = m.lock().unwrap();
+    let ok = store.delete_at(ts_unix);
+    if ok {
+        let _ = store.save(&stats_path());
+    }
+    ok
+}
+
+pub fn sessions_for_analysis(limit: usize) -> Vec<(String, Option<String>)> {
+    STATS
+        .get()
+        .map(|m| {
+            m.lock()
+                .unwrap()
+                .sessions
+                .iter()
+                .rev()
+                .filter(|s| !s.text.is_empty())
+                .take(limit)
+                .map(|s| (s.text.clone(), s.app.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn dictionary_entries() -> Vec<crate::hotkey::DictEntryDto> {

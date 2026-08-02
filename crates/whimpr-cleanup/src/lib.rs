@@ -69,12 +69,11 @@ impl CleanupProvider for OpenAiProvider {
             "messages": messages,
         });
 
-        let resp = self
-            .client
-            .post(&self.url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()?;
+        let mut req = self.client.post(&self.url).json(&body);
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+        let resp = req.send()?;
 
         let status = resp.status();
         if !status.is_success() {

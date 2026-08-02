@@ -2,7 +2,7 @@
 // without the shell) the invoke import fails and we fall back to defaults so the
 // Hub still renders for iteration.
 
-export type CleanupMode = "raw" | "local" | "open_ai" | "anthropic";
+export type CleanupMode = "raw" | "local" | "ollama" | "open_ai" | "anthropic";
 export type CleanupLevel = "none" | "light" | "medium" | "high";
 
 export interface Settings {
@@ -13,7 +13,28 @@ export interface Settings {
   // an OpenAI-compatible endpoint like OpenRouter (https://openrouter.ai/api/v1).
   openai_base_url: string;
   anthropic_model: string;
+  ollama_base_url: string;
+  ollama_model: string;
+  /** GGUF filename in the models folder; blank = auto-detect. */
+  local_model: string;
+  launch_at_login: boolean;
+  /** Push-to-talk hotkey, e.g. `option+w` or `fn`. */
+  ptt_hotkey: string;
+  writing_style: WritingStyle;
   sound_on_start: boolean;
+}
+
+export type WritingStyle = "default" | "formal" | "casual" | "very_casual" | "excited";
+
+export interface ServicesStatus {
+  ollama_running: boolean;
+  ollama_models: string[];
+  whisper_ready: boolean;
+  whisper_model: string | null;
+  gguf_ready: boolean;
+  gguf_model: string | null;
+  local_worker_ready: boolean;
+  whisper_loaded: boolean;
 }
 
 export interface Status {
@@ -51,11 +72,17 @@ export const EMPTY_STATS: StatsSummary = {
 };
 
 export const DEFAULT_SETTINGS: Settings = {
-  cleanup_mode: "open_ai",
+  cleanup_mode: "ollama",
   cleanup_level: "light",
   openai_model: "gpt-4o-mini",
   openai_base_url: "",
   anthropic_model: "claude-haiku-4-5",
+  ollama_base_url: "http://localhost:11434/v1",
+  ollama_model: "qwen3:1.7b",
+  local_model: "",
+  launch_at_login: false,
+  ptt_hotkey: "option+w",
+  writing_style: "default",
   sound_on_start: true,
 };
 
@@ -139,6 +166,7 @@ export async function setApiKey(provider: "openai" | "anthropic", key: string): 
 export interface HistoryItem {
   ts_unix: number;
   text: string;
+  raw_text?: string;
   app: string | null;
   words: number;
 }
@@ -180,5 +208,150 @@ export async function removeDictionaryEntry(correct: string): Promise<void> {
   } catch {
     /* browser preview — no-op */
   }
+}
+
+export async function getServices(): Promise<ServicesStatus | null> {
+  try {
+    return await invoke<ServicesStatus>("get_services");
+  } catch {
+    return null;
+  }
+}
+
+export async function startOllama(): Promise<void> {
+  await invoke<void>("start_ollama");
+}
+
+export async function pullOllamaModel(model: string): Promise<void> {
+  await invoke<void>("pull_ollama_model", { model });
+}
+
+export async function setLaunchAtLogin(enabled: boolean): Promise<void> {
+  try {
+    await invoke<void>("set_launch_at_login", { enabled });
+  } catch {
+    /* browser preview */
+  }
+}
+
+export async function isLaunchAtLoginEnabled(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("is_launch_at_login_enabled");
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteHistory(tsUnix: number): Promise<boolean> {
+  try {
+    return await invoke<boolean>("delete_history", { tsUnix });
+  } catch {
+    return false;
+  }
+}
+
+export interface InsightReport {
+  generated_at: number;
+  sessions_analyzed: number;
+  reading_grade: string;
+  complexity: string;
+  domain_depth: string;
+  summary: string;
+  topics: string[];
+  vocabulary_note: string;
+  error?: string;
+}
+
+export async function analyzeInsights(forceRefresh = false): Promise<InsightReport | null> {
+  try {
+    return await invoke<InsightReport>("analyze_insights", { forceRefresh });
+  } catch {
+    return null;
+  }
+}
+
+export async function getHotkeyPresets(): Promise<[string, string][]> {
+  try {
+    return await invoke<[string, string][]>("get_hotkey_presets");
+  } catch {
+    return [
+      ["option+w", "Option + W (recommended)"],
+      ["fn", "Fn / Globe key"],
+    ];
+  }
+}
+
+export interface LanguageStats {
+  sessions_analyzed: number;
+  avg_words_per_session: number;
+  avg_wpm: number;
+  cleanup_edit_rate: number;
+  filler_per_100_words: number;
+  avg_sentence_length: number;
+  unique_word_ratio: number;
+  top_apps: [string, number][];
+}
+
+export async function getLanguageStats(): Promise<LanguageStats | null> {
+  try {
+    return await invoke<LanguageStats>("get_language_stats");
+  } catch {
+    return null;
+  }
+}
+
+export interface Snippet {
+  trigger: string;
+  expansion: string;
+}
+
+export async function getSnippets(): Promise<Snippet[]> {
+  try {
+    return await invoke<Snippet[]>("get_snippets");
+  } catch {
+    return [];
+  }
+}
+
+export async function addSnippet(trigger: string, expansion: string): Promise<void> {
+  await invoke<void>("add_snippet", { trigger, expansion });
+}
+
+export async function removeSnippet(trigger: string): Promise<boolean> {
+  try {
+    return await invoke<boolean>("remove_snippet", { trigger });
+  } catch {
+    return false;
+  }
+}
+
+export interface TransformPreset {
+  id: string;
+  name: string;
+  instruction: string;
+}
+
+export async function getTransforms(): Promise<TransformPreset[]> {
+  try {
+    return await invoke<TransformPreset[]>("get_transforms");
+  } catch {
+    return [];
+  }
+}
+
+export async function saveTransform(preset: TransformPreset): Promise<void> {
+  await invoke<void>("save_transform", { preset });
+}
+
+export async function removeTransform(id: string): Promise<boolean> {
+  try {
+    return await invoke<boolean>("remove_transform", { id });
+  } catch {
+    return false;
+  }
+}
+
+export async function runTransform(presetId: string, instruction?: string): Promise<string> {
+  return await invoke<string>("run_transform", { presetId, instruction: instruction ?? null });
 }
 

@@ -1,22 +1,32 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { font } from "../tokens/values";
 import { theme } from "./theme";
 import { Button, Card, Dot, PageTitle, Segmented } from "./ui";
 import {
+  getServices,
+  getHotkeyPresets,
+  isLaunchAtLoginEnabled,
+  pullOllamaModel,
   requestAccessibility,
   requestInputMonitoring,
   requestMicrophone,
   setApiKey,
+  setLaunchAtLogin,
+  startOllama,
   type CleanupLevel,
   type CleanupMode,
+  type ServicesStatus,
   type Settings,
   type Status,
 } from "./api";
 
+const DEFAULT_OLLAMA_MODEL = "qwen3:1.7b";
+
 const MODES: { value: CleanupMode; label: string; hint: string }[] = [
   { value: "raw", label: "Raw", hint: "Paste exactly what you said" },
-  { value: "local", label: "Local", hint: "On-device model (offline)" },
-  { value: "open_ai", label: "OpenAI", hint: "Cloud cleanup via OpenAI (or an OpenAI-compatible API like OpenRouter — set the base URL below)" },
+  { value: "local", label: "Local GGUF", hint: "Offline backup — uses the .gguf file in your models folder via llama.cpp" },
+  { value: "ollama", label: "Ollama", hint: "Default path — uses models you already pulled with Ollama (recommended)" },
+  { value: "open_ai", label: "OpenAI", hint: "Cloud cleanup via OpenAI, DeepSeek, OpenRouter, etc." },
   { value: "anthropic", label: "Anthropic", hint: "Cloud cleanup via Claude" },
 ];
 
@@ -119,6 +129,259 @@ function PermRow({
   );
 }
 
+function ServiceRow({
+  ok,
+  label,
+  detail,
+  action,
+}: {
+  ok: boolean;
+  label: string;
+  detail: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", fontSize: 13, minWidth: 0 }}>
+        <Dot ok={ok} />
+        <span style={{ color: theme.textBody }}>
+          <b>{label}</b>{" "}
+          <span style={{ color: theme.textMuted }}>— {detail}</span>
+        </span>
+      </div>
+      {action}
+    </div>
+  );
+}
+
+function HotkeyPicker({
+  settings,
+  onChange,
+}: {
+  settings: Settings;
+  onChange: (s: Settings) => void;
+}) {
+  const [presets, setPresets] = useState<[string, string][]>([]);
+
+  useEffect(() => {
+    void getHotkeyPresets().then(setPresets);
+  }, []);
+
+  const inputStyle = {
+    width: "100%",
+    background: theme.cardBgSubtle,
+    border: `1px solid ${theme.border}`,
+    borderRadius: 10,
+    padding: "9px 12px",
+    color: theme.textBody,
+    fontFamily: font.mono,
+    fontSize: 13,
+    outline: "none",
+    boxSizing: "border-box" as const,
+  };
+
+  return (
+    <div>
+      <select
+        value={settings.ptt_hotkey}
+        onChange={(e) => onChange({ ...settings, ptt_hotkey: e.target.value })}
+        style={inputStyle}
+      >
+        {presets.map(([value, label]) => (
+          <option key={value} value={value}>
+            {label}
+          </option>
+        ))}
+        {!presets.some(([v]) => v === settings.ptt_hotkey) && (
+          <option value={settings.ptt_hotkey}>{settings.ptt_hotkey} (custom)</option>
+        )}
+      </select>
+      <div style={{ fontSize: 12, color: theme.textFaint, marginTop: 8, lineHeight: 1.5 }}>
+        Default is Option + W. Changes apply immediately — no restart. If the key doesn't respond,
+        grant Accessibility under Permissions below and relaunch once.
+      </div>
+    </div>
+  );
+}
+
+function ServicesCard({
+  settings,
+  onChange,
+}: {
+  settings: Settings;
+  onChange: (s: Settings) => void;
+}) {
+  const [services, setServices] = useState<ServicesStatus | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [loginAtBoot, setLoginAtBoot] = useState(settings.launch_at_login);
+
+  const refresh = useCallback(async () => {
+    const s = await getServices();
+    setServices(s);
+    const login = await isLaunchAtLoginEnabled();
+    setLoginAtBoot(login);
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const id = window.setInterval(() => void refresh(), 4000);
+    return () => window.clearInterval(id);
+  }, [refresh]);
+
+  const selectedInstalled =
+    services?.ollama_models.includes(settings.ollama_model) ?? false;
+
+  const inputStyle = {
+    width: "100%",
+    background: theme.cardBgSubtle,
+    border: `1px solid ${theme.border}`,
+    borderRadius: 10,
+    padding: "9px 12px",
+    color: theme.textBody,
+    fontFamily: font.mono,
+    fontSize: 13,
+    outline: "none",
+    boxSizing: "border-box" as const,
+  };
+
+  return (
+    <Card style={{ marginBottom: 16 }}>
+      <SectionTitle sub="WhimprFlow loads Whisper when it starts. Ollama is a separate app — start it once, then leave it running.">
+        Services
+      </SectionTitle>
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <ServiceRow
+          ok={!!services?.whisper_loaded}
+          label="Whisper (speech-to-text)"
+          detail={
+            services?.whisper_model
+              ? `${services.whisper_model}${services.whisper_loaded ? " — loaded" : " — loading…"}`
+              : "model file missing"
+          }
+        />
+        <ServiceRow
+          ok={!!services?.ollama_running}
+          label="Ollama (text cleanup)"
+          detail={
+            services?.ollama_running
+              ? `${services.ollama_models.length} model(s) installed`
+              : "not running — click Start"
+          }
+          action={
+            !services?.ollama_running ? (
+              <Button
+                size="sm"
+                disabled={busy === "ollama"}
+                onClick={async () => {
+                  setBusy("ollama");
+                  await startOllama();
+                  setTimeout(() => {
+                    void refresh();
+                    setBusy(null);
+                  }, 2500);
+                }}
+              >
+                Start Ollama
+              </Button>
+            ) : (
+              <span style={{ color: theme.accentDeep, fontSize: 13, fontWeight: 600 }}>Running</span>
+            )
+          }
+        />
+        <ServiceRow
+          ok={!!services?.gguf_ready}
+          label="GGUF backup (offline cleanup)"
+          detail={services?.gguf_model ?? "no .gguf found — optional fallback"}
+        />
+
+        {settings.cleanup_mode === "ollama" && (
+          <div style={{ marginTop: 4 }}>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginBottom: 6 }}>
+              Cleanup model (default {DEFAULT_OLLAMA_MODEL})
+            </div>
+            {services && services.ollama_models.length > 0 ? (
+              <select
+                value={settings.ollama_model}
+                onChange={(e) => onChange({ ...settings, ollama_model: e.target.value })}
+                style={inputStyle}
+              >
+                {!selectedInstalled && (
+                  <option value={settings.ollama_model}>{settings.ollama_model} (not installed)</option>
+                )}
+                {services.ollama_models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={settings.ollama_model}
+                placeholder={DEFAULT_OLLAMA_MODEL}
+                onChange={(e) => onChange({ ...settings, ollama_model: e.target.value })}
+                style={inputStyle}
+              />
+            )}
+            {!selectedInstalled && services?.ollama_running && (
+              <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
+                <Button
+                  size="sm"
+                  disabled={busy === "pull"}
+                  onClick={async () => {
+                    setBusy("pull");
+                    await pullOllamaModel(settings.ollama_model || DEFAULT_OLLAMA_MODEL);
+                    setTimeout(() => {
+                      void refresh();
+                      setBusy(null);
+                    }, 3000);
+                  }}
+                >
+                  Pull {settings.ollama_model || DEFAULT_OLLAMA_MODEL}
+                </Button>
+                <span style={{ fontSize: 12, color: theme.textMuted }}>
+                  Downloads in the background — check Ollama menubar for progress.
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            paddingTop: 8,
+            borderTop: `1px solid ${theme.border}`,
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>Launch WhimprFlow at login</div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 4 }}>
+              Keeps the dictation pill ready. Also enable “Launch Ollama at login” in the Ollama menubar app.
+            </div>
+          </div>
+          <Segmented
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
+            ]}
+            value={loginAtBoot ? "on" : "off"}
+            onChange={(v) => {
+              const on = v === "on";
+              setLoginAtBoot(on);
+              onChange({ ...settings, launch_at_login: on });
+              void setLaunchAtLogin(on);
+            }}
+          />
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 export function SettingsPane({
   settings,
   onChange,
@@ -134,6 +397,15 @@ export function SettingsPane({
     <div style={{ maxWidth: 720 }}>
       <PageTitle>Settings</PageTitle>
 
+      <ServicesCard settings={settings} onChange={onChange} />
+
+      <Card style={{ marginBottom: 16 }}>
+        <SectionTitle sub="Hold this key combo anywhere to dictate. Requires Accessibility permission — no macOS System Settings shortcut needed.">
+          Push-to-talk hotkey
+        </SectionTitle>
+        <HotkeyPicker settings={settings} onChange={onChange} />
+      </Card>
+
       <Card style={{ marginBottom: 16 }}>
         <SectionTitle sub="Where your dictation is cleaned up before it's typed.">Cleanup Engine</SectionTitle>
         <Segmented
@@ -145,6 +417,61 @@ export function SettingsPane({
           {MODES.find((m) => m.value === settings.cleanup_mode)?.hint}
         </div>
 
+        {settings.cleanup_mode === "ollama" && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginBottom: 6 }}>Ollama base URL</div>
+            <input
+              type="text"
+              value={settings.ollama_base_url}
+              placeholder="http://localhost:11434/v1"
+              onChange={(e) => onChange({ ...settings, ollama_base_url: e.target.value })}
+              style={{
+                width: "100%",
+                background: theme.cardBgSubtle,
+                border: `1px solid ${theme.border}`,
+                borderRadius: 10,
+                padding: "9px 12px",
+                color: theme.textBody,
+                fontFamily: font.mono,
+                fontSize: 13,
+                outline: "none",
+                boxSizing: "border-box",
+              }}
+            />
+            <div style={{ fontSize: 12, color: theme.textFaint, marginTop: 8 }}>
+              Pick your cleanup model in the Services section above. Avoid coder/reasoning models for dictation.
+            </div>
+          </div>
+        )}
+
+        {settings.cleanup_mode === "local" && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginBottom: 6 }}>
+              GGUF filename (optional — blank auto-picks the best .gguf in the models folder)
+            </div>
+            <input
+              type="text"
+              value={settings.local_model}
+              placeholder="qwen2.5-1.5b-instruct-q4_k_m.gguf"
+              onChange={(e) => onChange({ ...settings, local_model: e.target.value })}
+              style={{
+                width: "100%",
+                background: theme.cardBgSubtle,
+                border: `1px solid ${theme.border}`,
+                borderRadius: 10,
+                padding: "9px 12px",
+                color: theme.textBody,
+                fontFamily: font.mono,
+                fontSize: 13,
+                outline: "none",
+                boxSizing: "border-box",
+              }}
+            />
+          </div>
+        )}
+
+        {settings.cleanup_mode === "open_ai" && (
+        <>
         <KeyField
           label="OpenAI API key"
           configured={status.has_openai_key}
@@ -156,12 +483,12 @@ export function SettingsPane({
         <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: 12.5, color: theme.textMuted, marginBottom: 6 }}>
-              Base URL (blank = OpenAI; e.g. https://openrouter.ai/api/v1 for OpenRouter)
+              Base URL (blank = OpenAI; DeepSeek: https://api.deepseek.com/v1)
             </div>
             <input
               type="text"
               value={settings.openai_base_url}
-              placeholder="https://openrouter.ai/api/v1"
+              placeholder="https://api.deepseek.com/v1"
               onChange={(e) => onChange({ ...settings, openai_base_url: e.target.value })}
               style={{
                 width: "100%",
@@ -179,12 +506,12 @@ export function SettingsPane({
           </div>
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: 12.5, color: theme.textMuted, marginBottom: 6 }}>
-              Model (e.g. an OpenRouter model slug)
+              Model (OpenAI, DeepSeek, OpenRouter slug, etc.)
             </div>
             <input
               type="text"
               value={settings.openai_model}
-              placeholder="meta-llama/llama-3.3-70b-instruct:free"
+              placeholder="deepseek-chat"
               onChange={(e) => onChange({ ...settings, openai_model: e.target.value })}
               style={{
                 width: "100%",
@@ -201,6 +528,10 @@ export function SettingsPane({
             />
           </div>
         </div>
+        </>
+        )}
+
+        {settings.cleanup_mode === "anthropic" && (
         <KeyField
           label="Anthropic API key"
           configured={status.has_anthropic_key}
@@ -209,6 +540,7 @@ export function SettingsPane({
             setTimeout(refresh, 400);
           }}
         />
+        )}
       </Card>
 
       <Card style={{ marginBottom: 16 }}>
@@ -265,8 +597,8 @@ export function SettingsPane({
             label="Accessibility"
             detail={
               status.accessibility
-                ? "granted — Fn works everywhere + types your words"
-                : "the key one: makes Fn work in EVERY app AND types your words"
+                ? "granted — hotkey works everywhere + types your words"
+                : "required: global hotkey + typing into other apps"
             }
             onClick={() => {
               requestAccessibility();

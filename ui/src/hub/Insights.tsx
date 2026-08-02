@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { font } from "../tokens/values";
 import { theme } from "./theme";
-import { Card, PageTitle, useStats } from "./ui";
-import type { StatsSummary } from "./api";
+import { Button, Card, PageTitle, useStats } from "./ui";
+import { analyzeInsights, getLanguageStats, type InsightReport, type LanguageStats, type StatsSummary } from "./api";
 import { fmtCompact, fmtNum, newsArticles } from "./format";
 
 // ── Semicircular gauge ───────────────────────────────────────────────────────
@@ -221,7 +221,7 @@ function UsageTab({ stats }: { stats: StatsSummary }) {
           <Gauge value={stats.avg_wpm} max={140} />
         </StatCard>
 
-        <StatCard label="Fixes made by WhimprFlow" foot="dictations cleaned">
+        <StatCard label="Dictations cleaned" foot="sessions with cleanup applied">
           <BigNumber value={fmtCompact(stats.total_sessions)} accent />
         </StatCard>
 
@@ -257,19 +257,153 @@ function UsageTab({ stats }: { stats: StatsSummary }) {
   );
 }
 
-function VoiceTab() {
+function LocalStatsPanel({ stats }: { stats: LanguageStats }) {
+  if (stats.sessions_analyzed === 0) return null;
+  const metrics = [
+    { label: "Avg words / dictation", value: stats.avg_words_per_session.toFixed(1) },
+    { label: "Speaking pace", value: `${stats.avg_wpm} WPM` },
+    { label: "Avg sentence length", value: stats.avg_sentence_length.toFixed(1) },
+    { label: "Filler words", value: `${stats.filler_per_100_words.toFixed(1)} / 100 words` },
+    { label: "Cleanup edits", value: `${Math.round(stats.cleanup_edit_rate * 100)}% of sessions` },
+    { label: "Vocabulary breadth", value: `${Math.round(stats.unique_word_ratio * 100)}% unique` },
+  ];
   return (
     <Card>
-      <div style={{ padding: "28px 8px", textAlign: "center" }}>
-        <div style={{ fontFamily: font.serif, fontSize: 20, fontWeight: 600, color: theme.textStrong }}>
-          Your Voice
-        </div>
-        <p style={{ color: theme.textMuted, fontSize: 14, lineHeight: 1.55, maxWidth: 420, margin: "10px auto 0" }}>
-          Tone, pace, and filler-word insights are on the way. As you dictate, WhimprFlow will surface
-          patterns in how you speak — right here.
-        </p>
+      <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong, marginBottom: 14 }}>
+        Local analysis ({stats.sessions_analyzed} recent dictations)
       </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 14 }}>
+        {metrics.map((m) => (
+          <div key={m.label}>
+            <div style={{ fontSize: 11, color: theme.textFaint, textTransform: "uppercase", letterSpacing: 0.5 }}>
+              {m.label}
+            </div>
+            <div style={{ fontSize: 18, fontWeight: 600, color: theme.textStrong, marginTop: 4 }}>{m.value}</div>
+          </div>
+        ))}
+      </div>
+      {stats.top_apps.length > 0 && (
+        <div style={{ marginTop: 16, fontSize: 12.5, color: theme.textMuted }}>
+          Most dictated in: {stats.top_apps.map(([a, n]) => `${a} (${n})`).join(", ")}
+        </div>
+      )}
     </Card>
+  );
+}
+
+function VoiceTab() {
+  const [report, setReport] = useState<InsightReport | null>(null);
+  const [local, setLocal] = useState<LanguageStats | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = async (force = false) => {
+    setLoading(true);
+    const [r, l] = await Promise.all([analyzeInsights(force), getLanguageStats()]);
+    setReport(r);
+    setLocal(l);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    void load(false);
+  }, []);
+
+  if (loading && !report) {
+    return (
+      <Card>
+        <div style={{ padding: "36px 8px", textAlign: "center", color: theme.textMuted, fontSize: 14 }}>
+          Analyzing your recent dictations…
+        </div>
+      </Card>
+    );
+  }
+
+  if (!report || report.error) {
+    return (
+      <Card>
+        <div style={{ padding: "28px 8px", textAlign: "center" }}>
+          <div style={{ fontFamily: font.serif, fontSize: 20, fontWeight: 600, color: theme.textStrong }}>
+            Your Voice
+          </div>
+          <p style={{ color: theme.textMuted, fontSize: 14, lineHeight: 1.55, maxWidth: 460, margin: "10px auto 0" }}>
+            {report?.error ??
+              "Dictate a few times, then come back — WhimprFlow will estimate reading level, complexity, and topics via Ollama."}
+          </p>
+          <div style={{ marginTop: 16 }}>
+            <Button onClick={() => void load(true)} disabled={loading}>
+              {loading ? "Analyzing…" : "Analyze now"}
+            </Button>
+          </div>
+        </div>
+      </Card>
+    );
+  }
+
+  const metrics = [
+    { label: "Reading level", value: report.reading_grade },
+    { label: "Complexity", value: report.complexity },
+    { label: "Domain depth", value: report.domain_depth },
+  ];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      {local && <LocalStatsPanel stats={local} />}
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontSize: 13, color: theme.textMuted }}>
+          Based on {report.sessions_analyzed} recent dictation{report.sessions_analyzed === 1 ? "" : "s"}
+        </div>
+        <Button variant="ghost" size="sm" onClick={() => void load(true)} disabled={loading}>
+          Refresh
+        </Button>
+      </div>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 18 }}>
+        {metrics.map((m) => (
+          <Card key={m.label} style={{ flex: "1 1 180px", minWidth: 0 }}>
+            <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.6, textTransform: "uppercase", color: theme.textFaint }}>
+              {m.label}
+            </div>
+            <div style={{ fontFamily: font.serif, fontSize: 28, fontWeight: 600, color: theme.textStrong, marginTop: 8 }}>
+              {m.value || "—"}
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <Card>
+        <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong, marginBottom: 8 }}>Summary</div>
+        <p style={{ color: theme.textBody, fontSize: 14, lineHeight: 1.6, margin: 0 }}>{report.summary}</p>
+        {report.vocabulary_note && (
+          <p style={{ color: theme.textMuted, fontSize: 13, lineHeight: 1.55, margin: "12px 0 0" }}>
+            {report.vocabulary_note}
+          </p>
+        )}
+      </Card>
+
+      {report.topics.length > 0 && (
+        <Card>
+          <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong, marginBottom: 12 }}>Main topics</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {report.topics.map((t) => (
+              <span
+                key={t}
+                style={{
+                  fontSize: 12.5,
+                  padding: "6px 12px",
+                  borderRadius: 9999,
+                  background: theme.accentSoft,
+                  border: `1px solid ${theme.accentSoftBorder}`,
+                  color: theme.accentDeep,
+                }}
+              >
+                {t}
+              </span>
+            ))}
+          </div>
+        </Card>
+      )}
+    </div>
   );
 }
 

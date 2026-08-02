@@ -3,7 +3,7 @@ import { font, palette } from "../tokens/values";
 import { theme } from "./theme";
 import { Card, useStats } from "./ui";
 import { Icon } from "./icons";
-import { getHistory, type HistoryItem, type StatsSummary } from "./api";
+import { getHistory, deleteHistory, type HistoryItem, type StatsSummary } from "./api";
 import { dayKey, dayLabel, fmtCompact, fmtDuration, fmtNum, fmtTimeOfDay, wordsReference } from "./format";
 
 const UNLOCK_WORDS = 500;
@@ -77,8 +77,17 @@ function groupByDay(items: HistoryItem[]): Group[] {
   return groups;
 }
 
-function HistoryRow({ item }: { item: HistoryItem }) {
+function HistoryRow({
+  item,
+  onDelete,
+}: {
+  item: HistoryItem;
+  onDelete: (ts: number) => void;
+}) {
   const d = new Date(item.ts_unix * 1000);
+  const [showRaw, setShowRaw] = useState(false);
+  const hasRaw = !!item.raw_text && item.raw_text !== item.text;
+
   return (
     <div style={{ display: "flex", gap: 14, padding: "11px 4px", borderBottom: `1px solid ${theme.border}` }}>
       <div
@@ -93,16 +102,56 @@ function HistoryRow({ item }: { item: HistoryItem }) {
         {fmtTimeOfDay(d)}
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 13.5, lineHeight: 1.5, color: theme.textBody }}>{item.text}</div>
-        {item.app && (
-          <div style={{ fontSize: 11, color: theme.textFaint, marginTop: 3 }}>{item.app}</div>
-        )}
+        <div style={{ fontSize: 13.5, lineHeight: 1.5, color: theme.textBody }}>
+          {showRaw && hasRaw ? item.raw_text : item.text}
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 4, flexWrap: "wrap" }}>
+          {item.app && <div style={{ fontSize: 11, color: theme.textFaint }}>{item.app}</div>}
+          {hasRaw && (
+            <button
+              onClick={() => setShowRaw((v) => !v)}
+              style={{
+                border: "none",
+                background: "transparent",
+                cursor: "pointer",
+                fontFamily: font.ui,
+                fontSize: 11,
+                color: theme.accentDeep,
+                padding: 0,
+              }}
+            >
+              {showRaw ? "Show cleaned" : "Show raw"}
+            </button>
+          )}
+        </div>
       </div>
+      <button
+        title="Delete"
+        onClick={() => onDelete(item.ts_unix)}
+        style={{
+          flex: "0 0 auto",
+          border: "none",
+          background: "transparent",
+          cursor: "pointer",
+          color: theme.textFaint,
+          fontSize: 16,
+          lineHeight: 1,
+          padding: "2px 4px",
+        }}
+      >
+        ×
+      </button>
     </div>
   );
 }
 
-function HistorySection({ history }: { history: HistoryItem[] }) {
+function HistorySection({
+  history,
+  onDelete,
+}: {
+  history: HistoryItem[];
+  onDelete: (ts: number) => void;
+}) {
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
   const filtered = q ? history.filter((h) => h.text.toLowerCase().includes(q)) : history;
@@ -186,7 +235,7 @@ function HistorySection({ history }: { history: HistoryItem[] }) {
                 {g.label}
               </div>
               {g.items.map((it, i) => (
-                <HistoryRow key={`${it.ts_unix}-${i}`} item={it} />
+                <HistoryRow key={`${it.ts_unix}-${i}`} item={it} onDelete={onDelete} />
               ))}
             </div>
           ))
@@ -289,6 +338,11 @@ export function Home() {
     };
   }, []);
 
+  const handleDelete = async (ts: number) => {
+    const ok = await deleteHistory(ts);
+    if (ok) setHistory((h) => h.filter((x) => x.ts_unix !== ts));
+  };
+
   const today = stats.words_today;
 
   return (
@@ -314,7 +368,7 @@ export function Home() {
       <div style={{ display: "flex", flexWrap: "wrap", gap: 22, alignItems: "flex-start" }}>
         <div style={{ flex: "1 1 440px", minWidth: 0, display: "flex", flexDirection: "column", gap: 22 }}>
           <Banner />
-          <HistorySection history={history} />
+          <HistorySection history={history} onDelete={handleDelete} />
         </div>
         <div style={{ flex: "0 0 300px", width: 300, maxWidth: "100%" }}>
           <StatsCard stats={stats} />

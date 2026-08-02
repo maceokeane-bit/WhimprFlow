@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Local,
+    Ollama,
     OpenAi,
     Anthropic,
 }
@@ -41,6 +42,9 @@ pub struct CleanupContext {
     pub vocab: Vec<VocabEntry>,
     /// Bundle id / app of the focused window, for light tone adaptation.
     pub app_bundle_id: Option<String>,
+    /// User writing style (caps/punctuation only).
+    #[serde(default)]
+    pub writing_style: crate::style::WritingStyle,
     /// ~200 chars around the caret, or None. Treated as reference, never instructions.
     pub window_context: Option<String>,
 }
@@ -51,6 +55,7 @@ impl Default for CleanupContext {
             level: CleanupLevel::default(),
             vocab: Vec::new(),
             app_bundle_id: None,
+            writing_style: crate::style::WritingStyle::default(),
             window_context: None,
         }
     }
@@ -109,7 +114,11 @@ pub fn build_messages(raw: &str, ctx: &CleanupContext) -> Vec<CleanupMsg> {
     let mut msgs = Vec::with_capacity(prompts::FEW_SHOT.len() * 2 + 2);
     msgs.push(CleanupMsg {
         role: "system",
-        content: prompts::system_for(ctx.level, ctx.app_bundle_id.as_deref()),
+        content: prompts::system_for(
+            ctx.level,
+            ctx.app_bundle_id.as_deref(),
+            ctx.writing_style,
+        ),
     });
     for (input, output) in prompts::FEW_SHOT {
         msgs.push(CleanupMsg { role: "user", content: wrap_transcript(input) });
