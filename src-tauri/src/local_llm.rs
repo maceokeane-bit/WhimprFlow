@@ -4,12 +4,14 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 
 pub struct LocalWorker {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    responses: Receiver<Result<String, String>>,
 }
 
 impl LocalWorker {
@@ -20,9 +22,41 @@ impl LocalWorker {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = BufReader::new(child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?);
-        Ok(Self { child, stdin, stdout })
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let (sender, responses) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match stdout.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = sender.send(Err("local worker closed".into()));
+                        break;
+                    }
+                    Ok(_) => {
+                        if sender.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin,
+            responses,
+        })
     }
 
     /// Send one cleanup request (system prompt + few-shot turns + transcript) and
@@ -37,15 +71,25 @@ impl LocalWorker {
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
 
-        let mut resp = String::new();
-        if self.stdout.read_line(&mut resp)? == 0 {
-            anyhow::bail!("local worker closed");
-        }
+        let resp = match self.responses.recv_timeout(Duration::from_secs(45)) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => anyhow::bail!(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = self.child.kill();
+                anyhow::bail!("local worker timed out after 45 seconds");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("local worker response channel closed");
+            }
+        };
         let v: serde_json::Value = serde_json::from_str(&resp)?;
         if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
             anyhow::bail!("local llm: {err}");
         }
-        Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string())
+        Ok(v.get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string())
     }
 }
 

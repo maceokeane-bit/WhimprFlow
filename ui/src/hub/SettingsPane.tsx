@@ -3,6 +3,8 @@ import { font } from "../tokens/values";
 import { theme } from "./theme";
 import { Button, Card, Dot, PageTitle, Segmented } from "./ui";
 import {
+  cancelCleanupModelDownload,
+  getCleanupModelStatus,
   getServices,
   getHotkeyPresets,
   isLaunchAtLoginEnabled,
@@ -12,7 +14,9 @@ import {
   requestMicrophone,
   setApiKey,
   setLaunchAtLogin,
+  startCleanupModelDownload,
   startOllama,
+  type CleanupModelStatus,
   type CleanupLevel,
   type CleanupMode,
   type ServicesStatus,
@@ -21,6 +25,17 @@ import {
 } from "./api";
 
 const DEFAULT_OLLAMA_MODEL = "qwen3:8b";
+const DICTATION_LANGUAGES = [
+  ["en", "English"],
+  ["es", "Spanish"],
+  ["fr", "French"],
+  ["de", "German"],
+  ["it", "Italian"],
+  ["pt", "Portuguese"],
+  ["ja", "Japanese"],
+  ["ko", "Korean"],
+  ["zh", "Chinese"],
+] as const;
 
 /** True if `tag` is installed — handles `model` vs `model:latest` aliases. */
 function ollamaModelInstalled(models: string[], tag: string): boolean {
@@ -219,13 +234,18 @@ function ServicesCard({
   onChange: (s: Settings) => void;
 }) {
   const [services, setServices] = useState<ServicesStatus | null>(null);
+  const [cleanupModel, setCleanupModel] = useState<CleanupModelStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [loginAtBoot, setLoginAtBoot] = useState(settings.launch_at_login);
 
   const refresh = useCallback(async () => {
-    const s = await getServices();
-    setServices(s);
-    const login = await isLaunchAtLoginEnabled();
+    const [serviceStatus, modelStatus, login] = await Promise.all([
+      getServices(),
+      getCleanupModelStatus(),
+      isLaunchAtLoginEnabled(),
+    ]);
+    setServices(serviceStatus);
+    setCleanupModel(modelStatus);
     setLoginAtBoot(login);
   }, []);
 
@@ -238,6 +258,10 @@ function ServicesCard({
   const selectedInstalled = services
     ? ollamaModelInstalled(services.ollama_models, settings.ollama_model)
     : false;
+  const cleanupPercent =
+    cleanupModel && cleanupModel.total_bytes > 0
+      ? Math.round((cleanupModel.downloaded_bytes / cleanupModel.total_bytes) * 100)
+      : 0;
 
   const inputStyle = {
     width: "100%",
@@ -297,9 +321,36 @@ function ServicesCard({
           }
         />
         <ServiceRow
-          ok={!!services?.gguf_ready}
+          ok={cleanupModel?.state === "ready" || !!services?.gguf_ready}
           label="GGUF backup (offline cleanup)"
-          detail={services?.gguf_model ?? "no .gguf found — optional fallback"}
+          detail={
+            cleanupModel?.state === "downloading"
+              ? `downloading Qwen3 4B… ${cleanupPercent}%`
+              : cleanupModel?.state === "verifying"
+                ? "verifying downloaded model…"
+                : cleanupModel?.error ??
+                  services?.gguf_model ??
+                  "optional 2.5 GB fully local fallback"
+          }
+          action={
+            cleanupModel?.state === "downloading" ? (
+              <Button size="sm" variant="ghost" onClick={() => void cancelCleanupModelDownload()}>
+                Cancel
+              </Button>
+            ) : cleanupModel?.state === "ready" || services?.gguf_ready ? (
+              <span style={{ color: theme.accentDeep, fontSize: 13, fontWeight: 600 }}>Ready</span>
+            ) : (
+              <Button
+                size="sm"
+                onClick={async () => {
+                  await startCleanupModelDownload();
+                  void refresh();
+                }}
+              >
+                Download
+              </Button>
+            )
+          }
         />
 
         {settings.cleanup_mode === "ollama" && (
@@ -412,6 +463,34 @@ export function SettingsPane({
           Push-to-talk hotkey
         </SectionTitle>
         <HotkeyPicker settings={settings} onChange={onChange} />
+      </Card>
+
+      <Card style={{ marginBottom: 16 }}>
+        <SectionTitle sub="Used by both Parakeet and the Whisper fallback.">
+          Dictation language
+        </SectionTitle>
+        <select
+          value={settings.dictation_language}
+          onChange={(event) =>
+            onChange({ ...settings, dictation_language: event.target.value })
+          }
+          style={{
+            width: "100%",
+            background: theme.cardBgSubtle,
+            border: `1px solid ${theme.border}`,
+            borderRadius: 10,
+            padding: "10px 12px",
+            color: theme.textBody,
+            fontFamily: font.ui,
+            fontSize: 13,
+          }}
+        >
+          {DICTATION_LANGUAGES.map(([code, label]) => (
+            <option key={code} value={code}>
+              {label}
+            </option>
+          ))}
+        </select>
       </Card>
 
       <Card style={{ marginBottom: 16 }}>
@@ -577,6 +656,33 @@ export function SettingsPane({
               </button>
             );
           })}
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
+              Show Flow Bar
+            </div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2 }}>
+              Shows recording and processing status. Dictation continues while it is hidden.
+            </div>
+          </div>
+          <Segmented
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
+            ]}
+            value={settings.show_flow_bar ? "on" : "off"}
+            onChange={(v) =>
+              onChange({
+                ...settings,
+                show_flow_bar: v === "on",
+                flow_bar_snoozed_until: v === "on" ? null : settings.flow_bar_snoozed_until,
+              })
+            }
+          />
         </div>
       </Card>
 

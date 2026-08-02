@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { font, palette } from "../tokens/values";
 import { theme } from "./theme";
 import {
@@ -6,10 +6,26 @@ import {
   requestAccessibility,
   requestMicrophone,
   requestInputMonitoring,
+  relaunchApp,
   startModelDownload,
+  testMicrophone,
+  type MicrophoneTestResult,
   type ModelDownloadStatus,
+  type Settings,
   type Status,
 } from "./api";
+
+const DICTATION_LANGUAGES = [
+  { code: "en", label: "English" },
+  { code: "es", label: "Spanish" },
+  { code: "fr", label: "French" },
+  { code: "de", label: "German" },
+  { code: "it", label: "Italian" },
+  { code: "pt", label: "Portuguese" },
+  { code: "ja", label: "Japanese" },
+  { code: "ko", label: "Korean" },
+  { code: "zh", label: "Chinese" },
+] as const;
 
 // A blocking permission gate: the app can't be used until Accessibility and
 // Microphone are granted. The three permissions are presented in order (each
@@ -101,7 +117,15 @@ function Step({
   );
 }
 
-function ModelStep({ model, unlocked }: { model: ModelDownloadStatus; unlocked: boolean }) {
+function ModelStep({
+  n,
+  model,
+  unlocked,
+}: {
+  n: number;
+  model: ModelDownloadStatus;
+  unlocked: boolean;
+}) {
   const ready = model.state === "ready";
   const busy = model.state === "downloading" || model.state === "verifying";
   const percent =
@@ -139,7 +163,7 @@ function ModelStep({ model, unlocked }: { model: ModelDownloadStatus; unlocked: 
           background: ready ? theme.accentDeep : theme.track,
         }}
       >
-        {ready ? "✓" : 4}
+        {ready ? "✓" : n}
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontSize: 15, fontWeight: 600, color: theme.textStrong }}>
@@ -217,17 +241,210 @@ function ModelStep({ model, unlocked }: { model: ModelDownloadStatus; unlocked: 
   );
 }
 
+function MicrophoneTestStep({
+  result,
+  testing,
+  unlocked,
+  onTest,
+}: {
+  result: MicrophoneTestResult | null;
+  testing: boolean;
+  unlocked: boolean;
+  onTest: () => void;
+}) {
+  const passed = result?.heard_voice === true;
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 16,
+        padding: "16px 18px",
+        borderRadius: 14,
+        marginBottom: 12,
+        background: unlocked && !passed ? theme.accentSoft : theme.cardBg,
+        border: `1px solid ${unlocked && !passed ? theme.accentSoftBorder : theme.border}`,
+        boxShadow: theme.shadowSoft,
+        opacity: unlocked ? 1 : 0.5,
+      }}
+    >
+      <div
+        style={{
+          width: 30,
+          height: 30,
+          borderRadius: 999,
+          display: "grid",
+          placeItems: "center",
+          fontWeight: 700,
+          color: passed ? "#fff" : theme.textMuted,
+          background: passed ? theme.accentDeep : theme.track,
+        }}
+      >
+        {passed ? "✓" : 4}
+      </div>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 15, fontWeight: 600, color: theme.textStrong }}>
+          Test your microphone{" "}
+          <span style={{ fontSize: 12, color: theme.textFaint, fontWeight: 400 }}>· recommended</span>
+        </div>
+        <div style={{ fontSize: 13, color: theme.textMuted, marginTop: 2 }}>
+          {testing
+            ? "Speak normally for a moment…"
+            : passed
+              ? "Your voice came through clearly."
+              : result
+                ? "We did not hear enough audio. Check your selected microphone and try again."
+                : "Confirm WhimprFlow can hear your voice before your first dictation."}
+        </div>
+      </div>
+      <button
+        onClick={onTest}
+        disabled={!unlocked || testing}
+        style={{
+          border: "none",
+          borderRadius: 10,
+          padding: "9px 14px",
+          fontFamily: font.ui,
+          fontWeight: 600,
+          background: unlocked ? palette.slate900 : theme.textFaint,
+          color: "#fff",
+          cursor: unlocked && !testing ? "pointer" : "default",
+        }}
+      >
+        {testing ? "Listening…" : result ? "Test again" : "Start test"}
+      </button>
+    </div>
+  );
+}
+
+function LanguageStep({
+  value,
+  unlocked,
+  onChange,
+}: {
+  value: string;
+  unlocked: boolean;
+  onChange: (language: string) => void;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 16,
+        padding: "16px 18px",
+        borderRadius: 14,
+        marginBottom: 12,
+        background: theme.cardBg,
+        border: `1px solid ${theme.border}`,
+        boxShadow: theme.shadowSoft,
+        opacity: unlocked ? 1 : 0.5,
+      }}
+    >
+      <div
+        style={{
+          width: 30,
+          height: 30,
+          borderRadius: 999,
+          display: "grid",
+          placeItems: "center",
+          fontWeight: 700,
+          color: value ? "#fff" : theme.textMuted,
+          background: value ? theme.accentDeep : theme.track,
+        }}
+      >
+        {value ? "✓" : 5}
+      </div>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 15, fontWeight: 600, color: theme.textStrong }}>
+          Dictation language <span style={{ fontSize: 12, color: theme.textFaint }}>· required</span>
+        </div>
+        <div style={{ fontSize: 13, color: theme.textMuted, marginTop: 2 }}>
+          Choose the language WhimprFlow should recognize.
+        </div>
+      </div>
+      <select
+        value={value}
+        disabled={!unlocked}
+        onChange={(event) => onChange(event.target.value)}
+        style={{
+          border: `1px solid ${theme.border}`,
+          borderRadius: 10,
+          padding: "9px 12px",
+          fontFamily: font.ui,
+          background: theme.cardBg,
+          color: theme.textBody,
+        }}
+      >
+        {DICTATION_LANGUAGES.map((language) => (
+          <option key={language.code} value={language.code}>
+            {language.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function TutorialStep({ unlocked }: { unlocked: boolean }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 16,
+        padding: "16px 18px",
+        borderRadius: 14,
+        marginBottom: 12,
+        background: unlocked ? theme.accentSoft : theme.cardBg,
+        border: `1px solid ${unlocked ? theme.accentSoftBorder : theme.border}`,
+        boxShadow: theme.shadowSoft,
+        opacity: unlocked ? 1 : 0.5,
+      }}
+    >
+      <div
+        style={{
+          width: 30,
+          height: 30,
+          borderRadius: 999,
+          display: "grid",
+          placeItems: "center",
+          fontWeight: 700,
+          color: unlocked ? "#fff" : theme.textMuted,
+          background: unlocked ? theme.accentDeep : theme.track,
+        }}
+      >
+        {unlocked ? "✓" : 7}
+      </div>
+      <div>
+        <div style={{ fontSize: 15, fontWeight: 600, color: theme.textStrong }}>Your first dictation</div>
+        <div style={{ fontSize: 13, color: theme.textMuted, marginTop: 3, lineHeight: 1.45 }}>
+          Click a text field, hold <b>Fn</b>, speak naturally, then release. The Flow Bar shows
+          listening, transcription, formatting, and insertion progress.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function Onboarding({
   status,
   model,
+  settings,
+  onSettingsChange,
   refresh,
   onEnter,
 }: {
   status: Status;
   model: ModelDownloadStatus;
+  settings: Settings;
+  onSettingsChange: (settings: Settings) => void;
   refresh: () => void;
   onEnter: () => void;
 }) {
+  const [inputRequested, setInputRequested] = useState(false);
+  const [testingMicrophone, setTestingMicrophone] = useState(false);
+  const [microphoneResult, setMicrophoneResult] = useState<MicrophoneTestResult | null>(null);
   // Poll live so the state flips the moment macOS applies each grant.
   useEffect(() => {
     const id = setInterval(refresh, 1200);
@@ -237,19 +454,21 @@ export function Onboarding({
   const acc = status.accessibility;
   const mic = status.microphone;
   const inp = status.input_monitoring;
-  const canEnter = acc && mic && model.state === "ready";
+  const canEnter =
+    acc && mic && model.state === "ready" && settings.dictation_language.trim().length > 0;
 
   return (
     <div
       style={{
-        height: "100vh",
+        minHeight: "100vh",
         display: "flex",
-        alignItems: "center",
+        alignItems: "flex-start",
         justifyContent: "center",
         background: theme.pageBg,
         color: theme.textBody,
         fontFamily: font.ui,
-        padding: 24,
+        padding: "32px 24px",
+        overflowY: "auto",
       }}
     >
       <div style={{ width: 560, maxWidth: "100%" }}>
@@ -274,8 +493,8 @@ export function Onboarding({
           </span>
         </div>
         <p style={{ color: theme.textMuted, lineHeight: 1.5, margin: "0 0 24px" }}>
-          Grant these to <b>WhimprFlow</b>, in order. Each turns green here the moment macOS applies
-          it — no relaunch needed.
+          Grant the required permissions, verify your microphone, and choose your dictation
+          language.
         </p>
 
         <Step
@@ -306,9 +525,60 @@ export function Onboarding({
           active={acc && mic && !inp}
           locked={!(acc && mic)}
           required={false}
-          onGrant={() => requestInputMonitoring()}
+          onGrant={() => {
+            setInputRequested(true);
+            requestInputMonitoring();
+          }}
         />
-        <ModelStep model={model} unlocked={acc && mic} />
+        {inputRequested && !inp && (
+          <div
+            style={{
+              margin: "-4px 0 12px 46px",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              color: theme.textMuted,
+              fontSize: 12.5,
+            }}
+          >
+            <span>Input Monitoring may only take effect after restarting WhimprFlow.</span>
+            <button
+              onClick={() => void relaunchApp()}
+              style={{
+                border: `1px solid ${theme.border}`,
+                borderRadius: 9,
+                padding: "7px 11px",
+                background: theme.cardBg,
+                color: theme.textBody,
+                fontFamily: font.ui,
+                cursor: "pointer",
+              }}
+            >
+              Relaunch now
+            </button>
+          </div>
+        )}
+        <MicrophoneTestStep
+          result={microphoneResult}
+          testing={testingMicrophone}
+          unlocked={mic}
+          onTest={() => {
+            setTestingMicrophone(true);
+            void testMicrophone()
+              .then(setMicrophoneResult)
+              .finally(() => setTestingMicrophone(false));
+          }}
+        />
+        <LanguageStep
+          value={settings.dictation_language}
+          unlocked={mic}
+          onChange={(dictation_language) =>
+            onSettingsChange({ ...settings, dictation_language })
+          }
+        />
+        <ModelStep n={6} model={model} unlocked={acc && mic} />
+        <TutorialStep unlocked={canEnter} />
 
         <button
           onClick={onEnter}

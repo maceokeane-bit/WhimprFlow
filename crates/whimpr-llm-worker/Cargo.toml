@@ -16,6 +16,7 @@ path = "src/main.rs"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+whimpr-core = { path = "../whimpr-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 llama-cpp-2 = { version = "0.1", features = ["metal"] }

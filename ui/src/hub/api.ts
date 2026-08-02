@@ -18,6 +18,10 @@ export interface Settings {
   /** GGUF filename in the models folder; blank = auto-detect. */
   local_model: string;
   launch_at_login: boolean;
+  dictation_language: string;
+  onboarding_complete: boolean;
+  show_flow_bar: boolean;
+  flow_bar_snoozed_until: number | null;
   /** Push-to-talk hotkey, e.g. `option+w` or `fn`. */
   ptt_hotkey: string;
   writing_style: WritingStyle;
@@ -48,6 +52,14 @@ export interface Status {
 }
 
 export interface ModelDownloadStatus {
+  state: "missing" | "verifying" | "downloading" | "ready" | "cancelled" | "error";
+  model: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+  error: string | null;
+}
+
+export interface CleanupModelStatus {
   state: "missing" | "verifying" | "downloading" | "ready" | "cancelled" | "error";
   model: string;
   downloaded_bytes: number;
@@ -99,6 +111,10 @@ export const DEFAULT_SETTINGS: Settings = {
   ollama_model: "qwen3:8b",
   local_model: "",
   launch_at_login: false,
+  dictation_language: "en",
+  onboarding_complete: false,
+  show_flow_bar: true,
+  flow_bar_snoozed_until: null,
   ptt_hotkey: "option+w",
   writing_style: "default",
   sound_on_start: true,
@@ -156,6 +172,28 @@ export async function cancelModelDownload(): Promise<void> {
   await invoke<void>("cancel_model_download");
 }
 
+export async function getCleanupModelStatus(): Promise<CleanupModelStatus> {
+  try {
+    return await invoke<CleanupModelStatus>("get_cleanup_model_status");
+  } catch {
+    return {
+      state: "missing",
+      model: "Qwen3 4B Q4_K_M",
+      downloaded_bytes: 0,
+      total_bytes: 2_497_280_736,
+      error: null,
+    };
+  }
+}
+
+export async function startCleanupModelDownload(): Promise<void> {
+  await invoke<void>("start_cleanup_model_download");
+}
+
+export async function cancelCleanupModelDownload(): Promise<void> {
+  await invoke<void>("cancel_cleanup_model_download");
+}
+
 export async function getStats(): Promise<StatsSummary> {
   try {
     const tz = new Date().getTimezoneOffset(); // minutes to add to local -> UTC
@@ -173,6 +211,19 @@ export async function requestMicrophone(): Promise<void> {
   }
 }
 
+export interface MicrophoneTestResult {
+  peak: number;
+  heard_voice: boolean;
+}
+
+export async function testMicrophone(): Promise<MicrophoneTestResult> {
+  try {
+    return await invoke<MicrophoneTestResult>("test_microphone");
+  } catch {
+    return { peak: 0, heard_voice: false };
+  }
+}
+
 export async function requestAccessibility(): Promise<void> {
   try {
     await invoke<void>("request_accessibility");
@@ -187,6 +238,10 @@ export async function requestInputMonitoring(): Promise<void> {
   } catch {
     /* browser preview */
   }
+}
+
+export async function relaunchApp(): Promise<void> {
+  await invoke<void>("relaunch_app");
 }
 
 export async function setApiKey(provider: "openai" | "anthropic", key: string): Promise<void> {

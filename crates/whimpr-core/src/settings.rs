@@ -49,6 +49,18 @@ pub struct Settings {
     /// Start WhimprFlow automatically when you log in to macOS.
     #[serde(default)]
     pub launch_at_login: bool,
+    /// BCP-47/ISO language code used by the ASR backend.
+    #[serde(default = "default_dictation_language")]
+    pub dictation_language: String,
+    /// The first-run tutorial and required setup steps have been completed.
+    #[serde(default)]
+    pub onboarding_complete: bool,
+    /// Keep the floating Flow Bar visible and dictation enabled.
+    #[serde(default = "default_show_flow_bar")]
+    pub show_flow_bar: bool,
+    /// Unix timestamp until which the Flow Bar is temporarily snoozed.
+    #[serde(default)]
+    pub flow_bar_snoozed_until: Option<u64>,
     /// Push-to-talk hotkey, e.g. `option+w` or `fn`. Configured in-app (Accessibility required).
     #[serde(default = "crate::hotkey_binding::default_ptt_hotkey")]
     pub ptt_hotkey: String,
@@ -64,6 +76,14 @@ pub struct Settings {
 
 fn default_pause_media_while_dictating() -> bool {
     true
+}
+
+fn default_show_flow_bar() -> bool {
+    true
+}
+
+fn default_dictation_language() -> String {
+    "en".to_string()
 }
 
 fn default_ollama_base_url() -> String {
@@ -89,6 +109,10 @@ impl Default for Settings {
             ollama_model: default_ollama_model(),
             local_model: String::new(),
             launch_at_login: false,
+            dictation_language: default_dictation_language(),
+            onboarding_complete: false,
+            show_flow_bar: default_show_flow_bar(),
+            flow_bar_snoozed_until: None,
             ptt_hotkey: crate::hotkey_binding::default_ptt_hotkey(),
             writing_style: WritingStyle::default(),
             sound_on_start: true,
@@ -130,6 +154,8 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.cleanup_mode, CleanupMode::Ollama);
         assert_eq!(s.cleanup_level, CleanupLevel::Light);
+        assert_eq!(s.dictation_language, "en");
+        assert!(!s.onboarding_complete);
     }
 
     #[test]

@@ -32,6 +32,11 @@ pub struct AsrCaps {
 pub trait AsrEngine: Send + Sync {
     fn id(&self) -> AsrEngineId;
 
+    /// Change the recognition language without reloading model weights.
+    fn set_language(&self, _language: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn caps(&self) -> AsrCaps {
         AsrCaps {
             supports_streaming: false,

@@ -1,14 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { palette, pillFill, geometry, font } from "../tokens/values";
 
 // Visual states, mirroring the Rust `BarState`.
 export type BarState =
   | "idle"
+  | "listening"
   | "recording"
   | "locked"
   | "transcribing"
+  | "formatting"
+  | "processing"
   | "done"
+  | "paused"
   | "cancelled"
   | "error";
 
@@ -207,44 +212,57 @@ export function FlowBar() {
 
   useEffect(() => {
     setSlow(false);
-    if (state !== "transcribing") return;
+    if (!["transcribing", "formatting", "processing"].includes(state)) return;
     const id = window.setTimeout(() => setSlow(true), 4000);
     return () => window.clearTimeout(id);
   }, [state]);
 
   const recording = state === "recording" || state === "locked";
+  const listening = state === "listening";
   const isIdle = state === "idle";
-  const processing = state === "transcribing";
+  const processing = ["transcribing", "formatting", "processing"].includes(state);
   const isError = state === "error";
   const statusText =
     message ??
-    (processing
-      ? slow
-        ? "Still preparing your text…"
-        : "Preparing your text…"
-      : isError
-        ? "Something's off"
-        : state === "cancelled"
-          ? "Discarded"
-          : state === "done"
-            ? "Done"
-            : "");
+    (slow && processing
+      ? "Taking longer than usual"
+      : state === "transcribing"
+        ? "Transcribing…"
+        : state === "formatting"
+          ? "Using Polish"
+          : state === "processing"
+            ? "Preparing your text…"
+            : state === "listening" || state === "recording"
+              ? "Listening…"
+              : state === "locked"
+                ? "Hands-free"
+                : state === "paused"
+                  ? "Dictation paused"
+                  : isError
+                    ? "Something's not right"
+                    : state === "cancelled"
+                      ? "Discarded"
+                      : state === "done"
+                        ? "Done"
+                        : "");
 
   const dims = isIdle
     ? { w: 76, h: 16 }
     : recording
       ? { w: 250, h: 44 }
+      : listening
+        ? { w: 150, h: 36 }
       : processing && slow
         ? { w: 230, h: 38 }
         : processing
           ? { w: 205, h: 38 }
         : isError
-          ? { w: 210, h: 36 }
+          ? { w: Math.min(300, Math.max(210, statusText.length * 7.2 + 48)), h: 38 }
           : { w: 180, h: 36 };
 
   const borderColor = isError
     ? "rgba(255,107,107,0.45)"
-    : recording
+    : recording || listening
       ? "rgba(34,195,182,0.35)"
       : "rgba(255,255,255,0.10)";
 
@@ -258,6 +276,10 @@ export function FlowBar() {
         @keyframes whimpr-pulse {
           0%, 100% { opacity: 0.55; transform: scale(0.92); }
           50% { opacity: 1; transform: scale(1); }
+        }
+        @keyframes whimpr-content-in {
+          from { opacity: 0; transform: scale(0.86) translateY(2px); }
+          to { opacity: 1; transform: scale(1) translateY(0); }
         }
       `}</style>
       <div
@@ -273,6 +295,10 @@ export function FlowBar() {
       >
         <div
           aria-label={`WhimprFlow ${state}`}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            void invoke("show_flow_menu");
+          }}
           style={{
             display: "flex",
             alignItems: "center",
@@ -286,34 +312,50 @@ export function FlowBar() {
             borderRadius: 9999,
             boxShadow: isError ? "0 8px 28px rgba(255,90,82,0.22)" : pillFill.shadow,
             color: palette.pillText,
-            transition: `width ${geometry.morphMs}ms ${motionEase}, height ${geometry.morphMs}ms ${motionEase}, border-color 240ms ease`,
+            transition: `width ${geometry.morphMs}ms ${motionEase}, height ${geometry.morphMs}ms ${motionEase}, padding ${geometry.morphMs}ms ${motionEase}, transform ${geometry.morphMs}ms ${motionEase}, border-color 240ms ease, box-shadow ${geometry.morphMs}ms ease`,
             overflow: "hidden",
             fontSize: 13,
+            transform: isIdle ? "scale(0.96)" : "scale(1)",
+            transformOrigin: "center",
           }}
         >
-          {isIdle ? (
-            <IdleDot />
-          ) : recording ? (
-            <>
-              <CancelButton />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <DottedWaveform bars={bars} />
-              </div>
-              <StopButton />
-            </>
-          ) : (
-            <>
-              {processing && <Spinner />}
-              <span
-                style={{
-                  color: isError ? "#FFB4B4" : palette.pillTextMuted,
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {statusText}
-              </span>
-            </>
-          )}
+          <div
+            key={state}
+            style={{
+              width: "100%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: recording ? "space-between" : "center",
+              gap: 10,
+              animation: `whimpr-content-in ${Math.min(240, geometry.morphMs)}ms ${motionEase}`,
+            }}
+          >
+            {isIdle ? (
+              <IdleDot />
+            ) : recording ? (
+              <>
+                <CancelButton />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <DottedWaveform bars={bars} />
+                </div>
+                <StopButton />
+              </>
+            ) : (
+              <>
+                {processing && <Spinner />}
+                {listening && <IdleDot />}
+                {isError && <span aria-hidden="true">⚠</span>}
+                <span
+                  style={{
+                    color: isError ? "#FFB4B4" : palette.pillTextMuted,
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {statusText}
+                </span>
+              </>
+            )}
+          </div>
         </div>
       </div>
     </>

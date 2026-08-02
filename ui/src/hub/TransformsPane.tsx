@@ -60,6 +60,15 @@ export function TransformsPane() {
         via Ollama, and pastes the result back. Requires Accessibility + Ollama running.
       </p>
 
+      <Card style={{ marginBottom: 16, borderColor: theme.accentSoftBorder }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>Voice Command Mode</div>
+        <div style={{ fontSize: 13, color: theme.textMuted, marginTop: 5, lineHeight: 1.5 }}>
+          Select text, hold <b>Command + Control + Option</b> (or <b>Fn + Control</b>), speak an
+          instruction, then release. With no selection, WhimprFlow generates the requested content
+          at the cursor. Esc cancels.
+        </div>
+      </Card>
+
       {message && (
         <Card style={{ marginBottom: 16, borderColor: theme.accentSoftBorder }}>
           <div style={{ fontSize: 13, color: theme.textBody }}>{message}</div>

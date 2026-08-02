@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { font } from "../tokens/values";
 import { theme } from "./theme";
 import { Onboarding } from "./Onboarding";
@@ -47,29 +48,44 @@ export function App() {
     has_anthropic_key: false,
   });
 
-  const refresh = () => {
+  const refresh = useCallback(() => {
     void getStatus().then(setStatus);
     void getModelDownloadStatus().then(setModel);
-  };
+  }, []);
 
   useEffect(() => {
     getSettings().then(setLocalSettings);
     refresh();
-  }, []);
+    let unlisten: (() => void) | undefined;
+    void listen<Page>("whimpr://hub/navigate", (event) => setPage(event.payload)).then(
+      (cleanup) => (unlisten = cleanup),
+    );
+    return () => unlisten?.();
+  }, [refresh]);
 
   const update = (s: Settings) => {
     setLocalSettings(s);
     void setSettings(s);
   };
 
-  // Gate the app behind the setup wizard until the required permissions are granted.
-  if (!(status.accessibility && status.microphone && model.state === "ready") && !entered) {
+  // Gate first run until permissions, models, language, and tutorial are complete.
+  const setupIncomplete =
+    !settings.onboarding_complete ||
+    !status.accessibility ||
+    !status.microphone ||
+    model.state !== "ready";
+  if (setupIncomplete && !entered) {
     return (
       <Onboarding
         status={status}
         model={model}
+        settings={settings}
+        onSettingsChange={update}
         refresh={refresh}
-        onEnter={() => setEntered(true)}
+        onEnter={() => {
+          update({ ...settings, onboarding_complete: true });
+          setEntered(true);
+        }}
       />
     );
   }

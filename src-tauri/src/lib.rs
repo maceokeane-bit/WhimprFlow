@@ -9,13 +9,14 @@
 mod appctx;
 mod autolearn;
 mod caret;
+mod cleanup_model_manager;
 mod hotkey;
+mod insights;
 mod local_llm;
 mod media;
 mod model_manager;
 mod overlay;
 mod paste;
-mod insights;
 mod services;
 mod sound;
 mod transforms;
@@ -23,8 +24,9 @@ mod transforms;
 mod win;
 
 use serde::Serialize;
+use std::sync::OnceLock;
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
@@ -32,11 +34,7 @@ use tauri::{
 use overlay::OVERLAY_LABEL;
 
 const HUB_LABEL: &str = "main";
-
-#[derive(Clone, Serialize)]
-struct BarStatePayload {
-    state: &'static str,
-}
+static FLOW_MENU: OnceLock<Menu<tauri::Wry>> = OnceLock::new();
 
 fn build_overlay(app: &tauri::App) -> tauri::Result<tauri::WebviewWindow> {
     overlay::build_overlay(app)
@@ -51,14 +49,94 @@ fn build_hub(app: &tauri::App) -> tauri::Result<WebviewWindow> {
         .build()
 }
 
-fn emit_bar_state(app: &tauri::AppHandle, state: &'static str) {
-    overlay::present(app);
-    overlay::dispatch_state(app, state, None);
-    let _ = app.emit_to(
-        OVERLAY_LABEL,
-        "whimpr://flowbar/state",
-        BarStatePayload { state },
-    );
+fn show_hub(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(HUB_LABEL) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn navigate_hub(app: &tauri::AppHandle, page: &str) {
+    show_hub(app);
+    let _ = app.emit_to(HUB_LABEL, "whimpr://hub/navigate", page);
+}
+
+fn build_flow_menu(app: &tauri::App) -> tauri::Result<Menu<tauri::Wry>> {
+    let open = MenuItem::with_id(app, "open", "Open WhimprFlow", true, None::<&str>)?;
+    let paste_last = MenuItem::with_id(
+        app,
+        "paste_last",
+        "Paste Last Transcript",
+        true,
+        None::<&str>,
+    )?;
+    let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let microphone = MenuItem::with_id(app, "microphone", "Microphone", true, None::<&str>)?;
+    let languages = MenuItem::with_id(app, "languages", "Languages", true, None::<&str>)?;
+    let transforms = MenuItem::with_id(app, "transforms", "Transforms", true, None::<&str>)?;
+    let history = MenuItem::with_id(app, "history", "Transcript History", true, None::<&str>)?;
+    let toggle_bar = MenuItem::with_id(
+        app,
+        "toggle_bar",
+        "Show / Hide Flow Bar",
+        true,
+        None::<&str>,
+    )?;
+    let snooze = MenuItem::with_id(app, "snooze_bar", "Hide for 1 Hour", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let separator2 = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit WhimprFlow", true, None::<&str>)?;
+    Menu::with_items(
+        app,
+        &[
+            &open,
+            &paste_last,
+            &separator,
+            &settings,
+            &microphone,
+            &languages,
+            &transforms,
+            &history,
+            &toggle_bar,
+            &snooze,
+            &separator2,
+            &quit,
+        ],
+    )
+}
+
+fn handle_flow_menu_event(app: &tauri::AppHandle, event: MenuEvent) {
+    match event.id.as_ref() {
+        "open" => show_hub(app),
+        "settings" | "languages" => navigate_hub(app, "settings"),
+        "transforms" => navigate_hub(app, "transforms"),
+        "history" => navigate_hub(app, "home"),
+        "microphone" => {
+            request_microphone();
+            navigate_hub(app, "settings");
+        }
+        "paste_last" => {
+            if let Some(item) = hotkey::history(1).first() {
+                let _ = paste::paste_text(&item.text);
+            }
+        }
+        "toggle_bar" => toggle_flow_bar(app),
+        "snooze_bar" => snooze_flow_bar(app),
+        "quit" => app.exit(0),
+        _ => {}
+    }
+}
+
+#[tauri::command]
+fn show_flow_menu(app: tauri::AppHandle) -> Result<(), String> {
+    let menu = FLOW_MENU
+        .get()
+        .ok_or_else(|| "Flow Menu is not ready".to_string())?;
+    let window = app
+        .get_webview_window(OVERLAY_LABEL)
+        .ok_or_else(|| "Flow Bar window is unavailable".to_string())?;
+    menu.popup(window.as_ref().window())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -69,8 +147,62 @@ fn get_settings() -> whimpr_core::Settings {
 #[tauri::command]
 fn set_settings(app: tauri::AppHandle, settings: whimpr_core::Settings) {
     let launch = settings.launch_at_login;
-    hotkey::update_settings(settings);
+    hotkey::update_settings(settings.clone());
     sync_launch_at_login(&app, launch);
+    apply_flow_bar_visibility(&app, &settings);
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn apply_flow_bar_visibility(app: &tauri::AppHandle, settings: &whimpr_core::Settings) {
+    let now = unix_now();
+    let snoozed_until = settings.flow_bar_snoozed_until.filter(|until| *until > now);
+    let visible = settings.show_flow_bar && snoozed_until.is_none();
+    let was_visible = overlay::is_enabled();
+    overlay::set_enabled(app, visible);
+    if visible && !was_visible {
+        overlay::dispatch_state(app, "idle", None);
+    }
+
+    if let Some(until) = snoozed_until {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(
+                until.saturating_sub(unix_now()) + 1,
+            ));
+            let mut current = hotkey::current_settings();
+            if current.flow_bar_snoozed_until == Some(until) && unix_now() >= until {
+                current.flow_bar_snoozed_until = None;
+                hotkey::update_settings(current.clone());
+                overlay::set_enabled(&app, current.show_flow_bar);
+                if current.show_flow_bar {
+                    overlay::dispatch_state(&app, "idle", None);
+                }
+            }
+        });
+    }
+}
+
+fn toggle_flow_bar(app: &tauri::AppHandle) {
+    let mut settings = hotkey::current_settings();
+    settings.show_flow_bar = !settings.show_flow_bar;
+    if settings.show_flow_bar {
+        settings.flow_bar_snoozed_until = None;
+    }
+    hotkey::update_settings(settings.clone());
+    apply_flow_bar_visibility(app, &settings);
+}
+
+fn snooze_flow_bar(app: &tauri::AppHandle) {
+    let mut settings = hotkey::current_settings();
+    settings.flow_bar_snoozed_until = Some(unix_now() + 60 * 60);
+    hotkey::update_settings(settings.clone());
+    apply_flow_bar_visibility(app, &settings);
 }
 
 /// Aggregated dictation stats for the Hub dashboard. `tz_offset_minutes` is the
@@ -154,6 +286,38 @@ fn request_microphone() {
     }
 }
 
+#[derive(Clone, Serialize)]
+struct MicrophoneTestResult {
+    peak: f32,
+    heard_voice: bool,
+}
+
+#[tauri::command]
+async fn test_microphone() -> Result<MicrophoneTestResult, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let handle = whimpr_audio::start(|_: &[f32]| {}).map_err(|error| error.to_string())?;
+        std::thread::sleep(std::time::Duration::from_millis(1_600));
+        let audio = handle
+            .stop()
+            .ok_or_else(|| "Microphone test did not capture audio".to_string())?;
+        let peak = audio
+            .samples
+            .iter()
+            .fold(0.0_f32, |max, sample| max.max(sample.abs()));
+        Ok(MicrophoneTestResult {
+            peak,
+            heard_voice: peak >= 0.01,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn relaunch_app(app: tauri::AppHandle) {
+    app.restart();
+}
+
 /// Request Accessibility — the permission that makes the Fn key work in every app and
 /// lets us type into other apps. Fire the native prompt, then open the pane.
 #[tauri::command]
@@ -185,8 +349,7 @@ fn set_api_key(provider: String, key: String) -> Result<(), String> {
         "anthropic" => "anthropic_api_key",
         _ => return Err(format!("unknown provider {provider}")),
     };
-    let entry =
-        keyring::Entry::new("com.whimpr.whimprflow", account).map_err(|e| e.to_string())?;
+    let entry = keyring::Entry::new("com.whimpr.whimprflow", account).map_err(|e| e.to_string())?;
     let key = key.trim();
     // Delete any existing item first so the new one is created by (and readable to)
     // this app — a key added via the `security` CLI isn't readable by the app.
@@ -308,6 +471,21 @@ fn cancel_model_download() {
 }
 
 #[tauri::command]
+fn get_cleanup_model_status(app: tauri::AppHandle) -> cleanup_model_manager::CleanupModelStatus {
+    cleanup_model_manager::status(app)
+}
+
+#[tauri::command]
+fn start_cleanup_model_download(app: tauri::AppHandle) -> Result<(), String> {
+    cleanup_model_manager::start_download(app)
+}
+
+#[tauri::command]
+fn cancel_cleanup_model_download() {
+    cleanup_model_manager::cancel_download();
+}
+
+#[tauri::command]
 fn start_ollama() -> Result<(), String> {
     services::start_ollama()
 }
@@ -380,6 +558,9 @@ pub fn run() {
             get_model_download_status,
             start_model_download,
             cancel_model_download,
+            get_cleanup_model_status,
+            start_cleanup_model_download,
+            cancel_cleanup_model_download,
             start_ollama,
             pull_ollama_model,
             set_launch_at_login,
@@ -396,15 +577,19 @@ pub fn run() {
             run_transform,
             get_hotkey_presets,
             request_microphone,
+            test_microphone,
             request_accessibility,
             request_input_monitoring,
+            relaunch_app,
+            show_flow_menu,
             set_api_key
         ])
+        .on_menu_event(handle_flow_menu_event)
         .setup(|app| {
-            // Regular app: shows in the Dock with a normal, focusable main window.
-            // (Can switch to a menu-bar-only accessory app later for the Wispr look.)
+            // Menu-bar utility: Hub windows can still focus normally without a
+            // permanent Dock icon.
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Regular);
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             build_overlay(app)?;
             overlay::start_monitor_follow(app.handle().clone());
@@ -420,30 +605,14 @@ pub fn run() {
             if settings.launch_at_login {
                 sync_launch_at_login(app.handle(), true);
             }
+            apply_flow_bar_visibility(app.handle(), &settings);
 
-            let open = MenuItem::with_id(app, "open", "Open WhimprFlow", true, None::<&str>)?;
-            let demo_rec =
-                MenuItem::with_id(app, "demo_rec", "Demo: recording", true, None::<&str>)?;
-            let demo_idle = MenuItem::with_id(app, "demo_idle", "Demo: idle", true, None::<&str>)?;
-            let sep = PredefinedMenuItem::separator(app)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit WhimprFlow", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &demo_rec, &demo_idle, &sep, &quit])?;
+            let menu = build_flow_menu(app)?;
+            let _ = FLOW_MENU.set(menu.clone());
 
             let mut tray = TrayIconBuilder::new()
                 .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "open" => {
-                        if let Some(w) = app.get_webview_window(HUB_LABEL) {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
-                    "demo_rec" => emit_bar_state(app, "recording"),
-                    "demo_idle" => emit_bar_state(app, "idle"),
-                    "quit" => app.exit(0),
-                    _ => {}
-                });
+                .show_menu_on_left_click(false);
             if let Some(icon) = app.default_window_icon().cloned() {
                 tray = tray.icon(icon);
             }

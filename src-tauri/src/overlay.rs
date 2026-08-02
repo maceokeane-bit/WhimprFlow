@@ -2,16 +2,15 @@
 //!
 //! Fixed top-center placement on the computer's primary display.
 
-use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use tauri::{
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Monitor, Position, Size, WebviewUrl,
-    WebviewWindow,
-};
 #[cfg(not(target_os = "macos"))]
 use tauri::WebviewWindowBuilder;
+use tauri::{
+    AppHandle, LogicalPosition, LogicalSize, Manager, Monitor, Position, Size, WebviewUrl,
+    WebviewWindow,
+};
 #[cfg(target_os = "macos")]
 use tauri_nspanel::{tauri_panel, ManagerExt, PanelBuilder, PanelLevel, StyleMask};
 
@@ -24,6 +23,7 @@ const TOP_INSET: f64 = 52.0;
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
 
 static FOLLOW_STARTED: AtomicBool = AtomicBool::new(false);
+static VISIBLE: AtomicBool = AtomicBool::new(true);
 static LAST_TARGET_MONITOR: OnceLock<Mutex<Option<(i32, i32)>>> = OnceLock::new();
 static LAST_FRONTMOST_FRAME: OnceLock<Mutex<Option<(i32, i32, i32, i32)>>> = OnceLock::new();
 
@@ -43,24 +43,21 @@ pub fn build_overlay(app: &tauri::App) -> tauri::Result<WebviewWindow> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let overlay = WebviewWindowBuilder::new(
-            app,
-            OVERLAY_LABEL,
-            WebviewUrl::App("overlay.html".into()),
-        )
-        .title("WhimprBar")
-        .inner_size(OVERLAY_W, OVERLAY_H)
-        .decorations(false)
-        .transparent(true)
-        .shadow(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .accept_first_mouse(true)
-        .visible_on_all_workspaces(true)
-        .resizable(false)
-        .visible(true)
-        .build()?;
+        let overlay =
+            WebviewWindowBuilder::new(app, OVERLAY_LABEL, WebviewUrl::App("overlay.html".into()))
+                .title("WhimprBar")
+                .inner_size(OVERLAY_W, OVERLAY_H)
+                .decorations(false)
+                .transparent(true)
+                .shadow(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .focused(false)
+                .accept_first_mouse(true)
+                .visible_on_all_workspaces(true)
+                .resizable(false)
+                .visible(true)
+                .build()?;
         present_on(app.handle(), &overlay);
     }
 
@@ -113,6 +110,9 @@ fn build_macos_panel(app: &AppHandle) -> tauri::Result<()> {
 
 /// Re-anchor and re-assert z-order before every pill state change.
 pub fn present(app: &AppHandle) {
+    if !VISIBLE.load(Ordering::SeqCst) {
+        return;
+    }
     let app = app.clone();
     let app2 = app.clone();
     if let Err(e) = app.run_on_main_thread(move || {
@@ -123,6 +123,28 @@ pub fn present(app: &AppHandle) {
         }
     }) {
         eprintln!("[whimpr] overlay present failed to schedule on main thread: {e}");
+    }
+}
+
+pub fn is_enabled() -> bool {
+    VISIBLE.load(Ordering::SeqCst)
+}
+
+pub fn set_enabled(app: &AppHandle, enabled: bool) {
+    VISIBLE.store(enabled, Ordering::SeqCst);
+    let app = app.clone();
+    let app_for_task = app.clone();
+    if let Err(error) = app.run_on_main_thread(move || {
+        let Some(window) = overlay_window(&app_for_task) else {
+            return;
+        };
+        if enabled {
+            present_on(&app_for_task, &window);
+        } else {
+            let _ = window.hide();
+        }
+    }) {
+        eprintln!("[whimpr] overlay visibility scheduling failed: {error}");
     }
 }
 
@@ -151,8 +173,10 @@ pub fn start_monitor_follow(app: AppHandle) {
         let app_for_task = app.clone();
         if app
             .run_on_main_thread(move || {
-                if let Some(window) = overlay_window(&app_for_task) {
-                    reposition_on_active_monitor(&app_for_task, &window);
+                if VISIBLE.load(Ordering::SeqCst) {
+                    if let Some(window) = overlay_window(&app_for_task) {
+                        reposition_on_active_monitor(&app_for_task, &window);
+                    }
                 }
             })
             .is_err()
@@ -171,23 +195,6 @@ pub fn dispatch_state(app: &AppHandle, state: &str, message: Option<String>) {
     );
 }
 
-pub fn emit_state(app: &AppHandle, state: &str, message: Option<String>) {
-    present(app);
-    dispatch_state(app, state, message.clone());
-    let _ = app.emit_to(
-        OVERLAY_LABEL,
-        "whimpr://flowbar/state",
-        StatePayload { state, message },
-    );
-}
-
-#[derive(Clone, Serialize)]
-struct StatePayload<'a> {
-    state: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-}
-
 pub fn dispatch_waveform(app: &AppHandle, bars: &[f32]) {
     dispatch_to_panel(
         app,
@@ -199,16 +206,9 @@ pub fn dispatch_waveform(app: &AppHandle, bars: &[f32]) {
 
 /// WebKit evaluation must happen on the macOS main thread. This bypasses the
 /// NSPanel event-channel limitation without sacrificing the panel's visibility.
-fn dispatch_to_panel(
-    app: &AppHandle,
-    global: &str,
-    event: &str,
-    payload: serde_json::Value,
-) {
-    let (Ok(global), Ok(event)) = (
-        serde_json::to_string(global),
-        serde_json::to_string(event),
-    ) else {
+fn dispatch_to_panel(app: &AppHandle, global: &str, event: &str, payload: serde_json::Value) {
+    let (Ok(global), Ok(event)) = (serde_json::to_string(global), serde_json::to_string(event))
+    else {
         return;
     };
     let script = format!(

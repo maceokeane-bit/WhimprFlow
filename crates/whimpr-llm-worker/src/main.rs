@@ -49,8 +49,10 @@ struct Response {
 }
 
 fn main() -> anyhow::Result<()> {
-    let model_path = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().collect();
+    let model_path = args
+        .get(1)
+        .cloned()
         .or_else(|| std::env::var("WHIMPR_LLM_MODEL").ok())
         .context("model path required (argv[1] or WHIMPR_LLM_MODEL)")?;
 
@@ -60,6 +62,9 @@ fn main() -> anyhow::Result<()> {
     let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
         .with_context(|| format!("failed to load model {model_path}"))?;
     eprintln!("[llm-worker] model loaded, ready");
+    if args.iter().any(|arg| arg == "--eval") {
+        return run_eval(&backend, &model);
+    }
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -88,6 +93,59 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_eval(backend: &LlamaBackend, model: &LlamaModel) -> anyhow::Result<()> {
+    let cases = [
+        "um so i think we should uh meet at 3",
+        "send the invoice to account 12345 for 500 dollars",
+        "what time is the standup",
+        "first item new line second item new line third item",
+        "i can meet monday no actually make that tuesday afternoon",
+    ];
+    let mut passed = 0_u32;
+    let mut results = Vec::new();
+    for raw in cases {
+        let context = whimpr_core::CleanupContext::default();
+        let messages = whimpr_core::cleanup::build_messages(raw, &context)
+            .into_iter()
+            .map(|message| Msg {
+                role: message.role.to_string(),
+                content: message.content,
+            })
+            .collect();
+        let request = Request {
+            messages,
+            system: String::new(),
+            user: String::new(),
+            max_tokens: 400,
+        };
+        let generated = generate(backend, model, &request)?;
+        let cleaned = whimpr_core::cleanup::post_process(&generated);
+        let verdict = whimpr_core::cleanup::evaluate_gates(raw, &cleaned, context.level);
+        let ok = verdict.passed() && !cleaned.trim().is_empty();
+        if ok {
+            passed += 1;
+        }
+        results.push(serde_json::json!({
+            "raw": raw,
+            "cleaned": cleaned,
+            "passed": ok,
+            "verdict": format!("{verdict:?}"),
+        }));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "passed": passed,
+            "total": results.len(),
+            "results": results,
+        }))?
+    );
+    if passed as usize != results.len() {
+        anyhow::bail!("local cleanup evaluation failed");
+    }
+    Ok(())
+}
+
 fn generate(backend: &LlamaBackend, model: &LlamaModel, req: &Request) -> anyhow::Result<String> {
     // Qwen2.5 ChatML template. Prefer the full multi-turn message list (few-shot
     // demonstrations drive the newline/list/self-correction behavior); fall back
@@ -100,7 +158,10 @@ fn generate(backend: &LlamaBackend, model: &LlamaModel, req: &Request) -> anyhow
         ));
     } else {
         for m in &req.messages {
-            prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content));
+            prompt.push_str(&format!(
+                "<|im_start|>{}\n{}<|im_end|>\n",
+                m.role, m.content
+            ));
         }
     }
     prompt.push_str("<|im_start|>assistant\n");

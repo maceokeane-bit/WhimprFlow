@@ -203,4 +203,29 @@ mod tests {
     fn none_level_always_passes() {
         assert!(evaluate("anything", "totally different", CleanupLevel::None).passed());
     }
+
+    /// Fixture-style eval cases used to harden local cleanup against over-edit.
+    #[test]
+    fn fixture_light_keeps_names_and_times() {
+        let raw = "hey can you ping alex at 4 30 about the whimprflow launch";
+        let clean = "Hey, can you ping Alex at 4:30 about the WhimprFlow launch?";
+        assert!(evaluate(raw, clean, CleanupLevel::Light).passed());
+    }
+
+    #[test]
+    fn fixture_light_rejects_assistant_prefix() {
+        let raw = "when is the board meeting";
+        let clean = "Sure, the board meeting is tomorrow at 10am.";
+        assert!(matches!(
+            evaluate(raw, clean, CleanupLevel::Light),
+            GateVerdict::Fail(GateReason::BannedPattern(_))
+        ));
+    }
+
+    #[test]
+    fn fixture_medium_allows_tightening_but_keeps_entities() {
+        let raw = "um so basically i wanted to say that the meeting with jordan is at room 12b";
+        let clean = "The meeting with Jordan is in room 12B.";
+        assert!(evaluate(raw, clean, CleanupLevel::Medium).passed());
+    }
 }

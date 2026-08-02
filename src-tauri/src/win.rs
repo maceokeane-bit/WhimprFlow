@@ -392,6 +392,8 @@ pub fn asr_ready() -> bool {
 /// download is picked up on the next launch.
 pub fn load_asr_model() {}
 
+pub fn reload_local_worker() {}
+
 pub fn stats_summary(tz_offset_minutes: i32) -> StatsSummary {
     STATS
         .get()

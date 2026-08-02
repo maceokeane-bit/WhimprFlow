@@ -21,11 +21,11 @@ pub struct DictEntryDto {
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use super::DictEntryDto;
     use std::os::raw::c_void;
     use std::path::PathBuf;
-    use super::DictEntryDto;
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 
@@ -33,8 +33,8 @@ mod imp {
     use tauri::{AppHandle, Emitter};
     use whimpr_core::state::{Action, BarState};
     use whimpr_core::{
-        AsrEngine, CleanupContext, CleanupMode, CleanupProvider, Input, PipelineEvent, StateMachine,
-        TriggerToken,
+        AsrEngine, CleanupContext, CleanupMode, CleanupProvider, Input, PipelineEvent, RecordMode,
+        StateMachine, TriggerToken,
     };
     use whimpr_ipc::BindingId;
 
@@ -96,6 +96,11 @@ mod imp {
     const K_CG_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 
     static PTT_HELD: AtomicBool = AtomicBool::new(false);
+    static COMMAND_HELD: AtomicBool = AtomicBool::new(false);
+    static COMMAND_FINISHING: AtomicBool = AtomicBool::new(false);
+    static COMMAND_PROCESSING: AtomicBool = AtomicBool::new(false);
+    static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static BAR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     static APP: OnceLock<AppHandle> = OnceLock::new();
     static MACHINE: OnceLock<Mutex<StateMachine>> = OnceLock::new();
@@ -106,6 +111,7 @@ mod imp {
     /// Cleanup uses it to format for the medium (email vs. text vs. chat).
     static TARGET_APP: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     static CAPTURE: OnceLock<Mutex<Option<whimpr_audio::CaptureHandle>>> = OnceLock::new();
+    static COMMAND_CAPTURE: OnceLock<Mutex<Option<whimpr_audio::CaptureHandle>>> = OnceLock::new();
     static ASR: OnceLock<RwLock<Option<Arc<dyn AsrEngine>>>> = OnceLock::new();
     static VAD: OnceLock<Arc<whimpr_asr::SileroVadTrimmer>> = OnceLock::new();
     static ASR_LOADING: AtomicBool = AtomicBool::new(false);
@@ -118,6 +124,14 @@ mod imp {
     static SNIPPETS: OnceLock<Mutex<whimpr_core::SnippetStore>> = OnceLock::new();
     static TRANSFORMS: OnceLock<Mutex<whimpr_core::TransformStore>> = OnceLock::new();
     static STATS: OnceLock<Mutex<whimpr_core::StatsStore>> = OnceLock::new();
+
+    struct CommandProcessingGuard;
+
+    impl Drop for CommandProcessingGuard {
+        fn drop(&mut self) {
+            COMMAND_PROCESSING.store(false, Ordering::SeqCst);
+        }
+    }
 
     #[derive(Clone, Serialize)]
     struct BarPayload {
@@ -395,6 +409,14 @@ mod imp {
             *m.lock().unwrap() = new.clone();
         }
         let _ = new.save(&settings_path());
+        if let Some(engine) = ASR
+            .get()
+            .and_then(|slot| slot.read().ok()?.as_ref().cloned())
+        {
+            if let Err(error) = engine.set_language(&new.dictation_language) {
+                eprintln!("[whimpr] ASR language update failed: {error}");
+            }
+        }
         rebuild_providers();
     }
 
@@ -447,6 +469,14 @@ mod imp {
         }
     }
 
+    pub fn reload_local_worker() {
+        std::thread::spawn(|| {
+            let worker = crate::local_llm::spawn_default();
+            let slot = LOCAL.get_or_init(|| Mutex::new(None));
+            *slot.lock().unwrap() = worker;
+        });
+    }
+
     /// Clean a raw transcript per the current settings (mode + level), feeding in the
     /// dictionary vocabulary relevant to this utterance. Falls back to raw whenever
     /// cleanup is off, the provider is unavailable, it errors, or the gates reject it.
@@ -481,15 +511,24 @@ mod imp {
         };
         // Run the on-device model with the same prompt + per-app formatting.
         let run_local = || -> Option<anyhow::Result<String>> {
-            LOCAL.get().and_then(|m| {
-                m.lock().unwrap().as_mut().map(|w| {
-                    // System prompt + few-shot demonstration turns + the transcript,
-                    // so the on-device model actually produces newlines/lists and
-                    // resolves self-corrections instead of just being told to.
-                    let messages = whimpr_core::cleanup::build_messages(raw, &ctx);
-                    w.cleanup(&messages)
-                })
-            })
+            let messages = whimpr_core::cleanup::build_messages(raw, &ctx);
+            let local = LOCAL.get_or_init(|| Mutex::new(crate::local_llm::spawn_default()));
+            let mut worker = local.lock().unwrap();
+            if worker.is_none() {
+                *worker = crate::local_llm::spawn_default();
+            }
+            let first = worker.as_mut()?.cleanup(&messages);
+            match first {
+                Ok(cleaned) => Some(Ok(cleaned)),
+                Err(first_error) => {
+                    eprintln!("[whimpr] local worker failed; restarting once: {first_error}");
+                    *worker = crate::local_llm::spawn_default();
+                    Some(match worker.as_mut() {
+                        Some(restarted) => restarted.cleanup(&messages),
+                        None => Err(first_error),
+                    })
+                }
+            }
         };
         // Selected provider, falling back to local when a cloud key can't be read
         // (so cleanup still runs) — and Local mode uses the worker directly.
@@ -542,13 +581,16 @@ mod imp {
     }
 
     fn now_ms() -> u64 {
-        CLOCK.get().map(|c| c.elapsed().as_millis() as u64).unwrap_or(0)
+        CLOCK
+            .get()
+            .map(|c| c.elapsed().as_millis() as u64)
+            .unwrap_or(0)
     }
 
     fn bar_name(b: BarState) -> &'static str {
         match b {
             BarState::Idle => "idle",
-            BarState::Recording => "recording",
+            BarState::Recording => "listening",
             BarState::Locked => "locked",
             BarState::Transcribing => "transcribing",
             BarState::Done => "done",
@@ -562,6 +604,7 @@ mod imp {
     }
 
     fn emit_bar_msg(app: &AppHandle, state: &'static str, message: Option<String>) {
+        BAR_SEQUENCE.fetch_add(1, Ordering::SeqCst);
         eprintln!("[whimpr] pill -> {state}");
         crate::overlay::present(app);
         crate::overlay::dispatch_state(app, state, message.clone());
@@ -570,6 +613,31 @@ mod imp {
             "whimpr://flowbar/state",
             BarPayload { state, message },
         );
+    }
+
+    fn fail_pipeline(app: &AppHandle, session: whimpr_core::SessionId, message: &'static str) {
+        emit_bar_msg(app, "error", Some(message.into()));
+        let sequence = BAR_SEQUENCE.load(Ordering::SeqCst);
+        handle_input(Input::Pipeline(PipelineEvent::Failed { session }));
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2_500));
+            if BAR_SEQUENCE.load(Ordering::SeqCst) == sequence {
+                emit_bar(&app, "idle");
+            }
+        });
+    }
+
+    fn emit_command_error(app: &AppHandle, message: impl Into<String>) {
+        emit_bar_msg(app, "error", Some(message.into()));
+        let sequence = BAR_SEQUENCE.load(Ordering::SeqCst);
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2_500));
+            if BAR_SEQUENCE.load(Ordering::SeqCst) == sequence {
+                emit_bar(&app, "idle");
+            }
+        });
     }
 
     /// Feed one input into the shared state machine and enact its actions.
@@ -592,16 +660,19 @@ mod imp {
                 emit_bar(app, bar_name(bar));
                 // Let the "done" tick linger briefly before returning to idle.
                 if bar == BarState::Done {
+                    let sequence = BAR_SEQUENCE.load(Ordering::SeqCst);
                     let app2 = app.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_millis(500));
-                        emit_bar(&app2, "idle");
+                        if BAR_SEQUENCE.load(Ordering::SeqCst) == sequence {
+                            emit_bar(&app2, "idle");
+                        }
                     });
                 }
             }
             // Start the microphone; stream real RMS bars to the pill waveform.
             // Runs off the tap thread so the mic-permission prompt can't stall keys.
-            Action::StartCapture { .. } => {
+            Action::StartCapture { session, mode } => {
                 if current_settings().pause_media_while_dictating {
                     let _ = app.run_on_main_thread(|| {
                         crate::media::on_dictation_start();
@@ -622,9 +693,40 @@ mod imp {
                     }) {
                         Ok(handle) => {
                             eprintln!("[whimpr] mic capture started — waveform active");
-                            *CAPTURE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(handle);
+                            *CAPTURE.get_or_init(|| Mutex::new(None)).lock().unwrap() =
+                                Some(handle);
+                            std::thread::sleep(Duration::from_millis(160));
+                            let still_recording = MACHINE
+                                .get()
+                                .map(|machine| {
+                                    matches!(
+                                        machine.lock().unwrap().state(),
+                                        whimpr_core::DictationState::Recording {
+                                            session: current,
+                                            ..
+                                        } if current == session
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if still_recording {
+                                emit_bar(
+                                    &app_thread,
+                                    if mode == RecordMode::Locked {
+                                        "locked"
+                                    } else {
+                                        "recording"
+                                    },
+                                );
+                            }
                         }
-                        Err(e) => eprintln!("[whimpr] mic capture failed to start: {e}"),
+                        Err(e) => {
+                            eprintln!("[whimpr] mic capture failed to start: {e}");
+                            emit_bar_msg(
+                                &app_thread,
+                                "error",
+                                Some("No microphone detected".into()),
+                            );
+                        }
                     }
                 });
             }
@@ -638,12 +740,9 @@ mod imp {
                 let app2 = app.clone();
                 let handle = CAPTURE.get().and_then(|slot| slot.lock().unwrap().take());
                 std::thread::spawn(move || {
-                    // Whatever happens, return the pill to idle (done -> idle).
-                    let finish =
-                        || handle_input(Input::Pipeline(PipelineEvent::Committed { session }));
                     let Some(res) = handle.and_then(|h| h.stop()) else {
                         eprintln!("[whimpr] no audio captured");
-                        finish();
+                        fail_pipeline(&app2, session, "Microphone unavailable");
                         return;
                     };
                     let peak = res.samples.iter().fold(0f32, |m, &s| m.max(s.abs()));
@@ -660,13 +759,15 @@ mod imp {
                              Microphone access to your terminal (System Settings → Privacy & \
                              Security → Microphone), then fully quit + reopen it and rerun."
                         );
+                        fail_pipeline(&app2, session, "We couldn't hear you");
+                        return;
                     }
                     let Some(asr) = ASR
                         .get()
                         .and_then(|slot| slot.read().ok()?.as_ref().cloned())
                     else {
                         eprintln!("[whimpr] ASR not ready (model still loading or missing)");
-                        finish();
+                        fail_pipeline(&app2, session, "No Model Available");
                         return;
                     };
                     let pcm = whimpr_audio::resample_to_16k(&res.samples, res.sample_rate);
@@ -697,12 +798,29 @@ mod imp {
                                 }
                             }
                             eprintln!("[whimpr] TRANSCRIPT: \"{}\"", raw);
+                            if raw.trim().is_empty() {
+                                fail_pipeline(&app2, session, "We couldn't hear you");
+                                return;
+                            }
                             // Clean the transcript (cloud LLM if configured), then paste.
+                            let settings = current_settings();
+                            if matches!(settings.cleanup_mode, CleanupMode::Raw)
+                                || settings.cleanup_level.bypasses_llm()
+                            {
+                                emit_bar_msg(
+                                    &app2,
+                                    "processing",
+                                    Some("Preparing your text…".into()),
+                                );
+                            } else {
+                                emit_bar_msg(&app2, "formatting", Some("Using Polish".into()));
+                            }
                             let text = clean_transcript(&raw);
                             if text != raw {
                                 eprintln!("[whimpr] CLEANED:   \"{}\"", text);
                             }
                             if !text.is_empty() {
+                                emit_bar_msg(&app2, "processing", Some("Inserting text…".into()));
                                 if let Err(e) = crate::paste::paste_text(&text) {
                                     eprintln!("[whimpr] paste failed: {e}");
                                     let message = if e.to_string().contains("secure text fields") {
@@ -710,23 +828,20 @@ mod imp {
                                     } else {
                                         "Couldn't insert text — check Accessibility"
                                     };
-                                    emit_bar_msg(
-                                        &app2,
-                                        "error",
-                                        Some(message.into()),
-                                    );
+                                    fail_pipeline(&app2, session, message);
+                                    return;
                                 } else {
                                     record_dictation(&raw, &text, res.duration_secs());
                                     crate::autolearn::watch_correction(&text);
                                 }
                             }
+                            handle_input(Input::Pipeline(PipelineEvent::Committed { session }));
                         }
                         Err(e) => {
                             eprintln!("[whimpr] ASR error: {e}");
-                            emit_bar_msg(&app2, "error", Some("Transcription failed".into()));
+                            fail_pipeline(&app2, session, "Something's not right");
                         }
                     }
-                    finish();
                 });
             }
             Action::DiscardCapture { .. } => {
@@ -782,6 +897,175 @@ mod imp {
         }));
     }
 
+    fn command_down() {
+        if PTT_HELD.load(Ordering::SeqCst)
+            || COMMAND_PROCESSING.load(Ordering::SeqCst)
+            || COMMAND_HELD.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        COMMAND_FINISHING.store(false, Ordering::SeqCst);
+        COMMAND_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        eprintln!("[whimpr] COMMAND MODE DOWN");
+        *TARGET_APP.get_or_init(|| Mutex::new(None)).lock().unwrap() =
+            crate::appctx::frontmost_bundle_id();
+        emit_bar(APP.get().expect("app installed"), "listening");
+        let app = APP.get().expect("app installed").clone();
+        std::thread::spawn(move || {
+            if current_settings().sound_on_start {
+                crate::sound::play_record_ping();
+            }
+            let app_cb = app.clone();
+            match whimpr_audio::start(move |bars| {
+                crate::overlay::dispatch_waveform(&app_cb, bars);
+            }) {
+                Ok(handle) => {
+                    if COMMAND_HELD.load(Ordering::SeqCst)
+                        || COMMAND_FINISHING.load(Ordering::SeqCst)
+                    {
+                        *COMMAND_CAPTURE
+                            .get_or_init(|| Mutex::new(None))
+                            .lock()
+                            .unwrap() = Some(handle);
+                        emit_bar(&app, "recording");
+                    } else {
+                        let _ = handle.stop();
+                    }
+                }
+                Err(error) => {
+                    COMMAND_HELD.store(false, Ordering::SeqCst);
+                    emit_bar_msg(
+                        &app,
+                        "error",
+                        Some(format!("Microphone unavailable: {error}")),
+                    );
+                }
+            }
+        });
+    }
+
+    fn command_up() {
+        if !COMMAND_HELD.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        COMMAND_FINISHING.store(true, Ordering::SeqCst);
+        eprintln!("[whimpr] COMMAND MODE UP");
+        let app = APP.get().expect("app installed").clone();
+        let command_sequence = COMMAND_SEQUENCE.load(Ordering::SeqCst);
+        std::thread::spawn(move || {
+            COMMAND_PROCESSING.store(true, Ordering::SeqCst);
+            let _processing_guard = CommandProcessingGuard;
+            let mut handle = None;
+            for _ in 0..50 {
+                handle = COMMAND_CAPTURE
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .unwrap()
+                    .take();
+                if handle.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            COMMAND_FINISHING.store(false, Ordering::SeqCst);
+            if COMMAND_SEQUENCE.load(Ordering::SeqCst) != command_sequence {
+                if let Some(capture) = handle {
+                    let _ = capture.stop();
+                }
+                return;
+            }
+            let Some(audio) = handle.and_then(|capture| capture.stop()) else {
+                emit_command_error(&app, "Command Mode captured no audio");
+                return;
+            };
+            emit_bar_msg(&app, "transcribing", Some("Transcribing command…".into()));
+            let Some(asr) = ASR
+                .get()
+                .and_then(|slot| slot.read().ok()?.as_ref().cloned())
+            else {
+                emit_command_error(&app, "No Model Available");
+                return;
+            };
+            let pcm = whimpr_audio::resample_to_16k(&audio.samples, audio.sample_rate);
+            let instruction = match asr.transcribe(&pcm) {
+                Ok(transcript) if !transcript.text.trim().is_empty() => transcript.text,
+                Ok(_) => {
+                    emit_command_error(&app, "We couldn't hear your command");
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("[whimpr] command ASR failed: {error}");
+                    emit_command_error(&app, "Command transcription failed");
+                    return;
+                }
+            };
+            let selected = match crate::paste::copy_selection() {
+                Ok(selection) => selection.unwrap_or_default(),
+                Err(error) => {
+                    eprintln!("[whimpr] command selection read failed: {error}");
+                    String::new()
+                }
+            };
+            if selected.split_whitespace().count() > 1_000 {
+                emit_command_error(
+                    &app,
+                    "Too long to transform — select fewer than 1,000 words",
+                );
+                return;
+            }
+            let settings = current_settings();
+            emit_bar_msg(&app, "formatting", Some("Applying command…".into()));
+            match crate::transforms::apply_via_ollama(
+                &selected,
+                &instruction,
+                &settings.ollama_base_url,
+                &settings.ollama_model,
+            ) {
+                Ok(output) => {
+                    if COMMAND_SEQUENCE.load(Ordering::SeqCst) != command_sequence {
+                        return;
+                    }
+                    if let Err(error) = crate::paste::paste_text(&output) {
+                        eprintln!("[whimpr] command paste failed: {error}");
+                        emit_command_error(&app, "Command Mode couldn't update the text");
+                        return;
+                    }
+                    emit_bar(&app, "done");
+                    let sequence = BAR_SEQUENCE.load(Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(700));
+                    if BAR_SEQUENCE.load(Ordering::SeqCst) == sequence {
+                        emit_bar(&app, "idle");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[whimpr] command transform failed: {error}");
+                    emit_command_error(&app, "Command Mode needs Ollama running");
+                }
+            }
+        });
+    }
+
+    fn command_cancel() {
+        if !COMMAND_HELD.swap(false, Ordering::SeqCst)
+            && !COMMAND_FINISHING.swap(false, Ordering::SeqCst)
+            && !COMMAND_PROCESSING.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        COMMAND_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        if let Some(capture) = COMMAND_CAPTURE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .take()
+        {
+            let _ = capture.stop();
+        }
+        if let Some(app) = APP.get() {
+            emit_bar(app, "cancelled");
+        }
+    }
+
     /// Returning null from the tap callback drops the event so it never reaches apps.
     fn swallow_event() -> CGEventRef {
         null_mut()
@@ -803,17 +1087,44 @@ mod imp {
 
         let binding = current_binding();
         let at_ms = now_ms();
-        let keycode =
-            unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
+        let keycode = unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
         let flags = unsafe { CGEventGetFlags(event) };
 
         // Esc cancels from any state (let Esc through so other apps still see it).
         if etype == K_CG_EVENT_KEY_DOWN && keycode == KEYCODE_ESC {
+            if COMMAND_HELD.load(Ordering::SeqCst)
+                || COMMAND_FINISHING.load(Ordering::SeqCst)
+                || COMMAND_PROCESSING.load(Ordering::SeqCst)
+            {
+                command_cancel();
+                return swallow_event();
+            }
             if PTT_HELD.load(Ordering::SeqCst) {
                 ptt_up(at_ms);
                 handle_input(Input::Trigger(TriggerToken::Cancel { at_ms }));
             }
             return event;
+        }
+
+        // Command Mode: hold Command+Control+Option (or Fn+Control), speak an
+        // instruction, then release to transform selected text — or generate at
+        // the cursor when nothing is selected.
+        if etype == K_CG_EVENT_FLAGS_CHANGED {
+            let cmd_ctrl_opt = whimpr_core::hotkey_binding::flags::COMMAND
+                | whimpr_core::hotkey_binding::flags::CONTROL
+                | whimpr_core::hotkey_binding::flags::ALT;
+            let fn_ctrl = whimpr_core::hotkey_binding::flags::FN
+                | whimpr_core::hotkey_binding::flags::CONTROL;
+            let command_chord = flags & cmd_ctrl_opt == cmd_ctrl_opt
+                || (flags & fn_ctrl == fn_ctrl && (flags & FLAG_SECONDARY_FN) != 0);
+            if command_chord {
+                command_down();
+                return swallow_event();
+            }
+            if COMMAND_HELD.load(Ordering::SeqCst) {
+                command_up();
+                return swallow_event();
+            }
         }
 
         if binding.is_fn {
@@ -846,8 +1157,7 @@ mod imp {
 
         // Key + modifier combo (e.g. option+w) — swallow so Option+letter doesn't type ∑, Ω, etc.
         if keycode == binding.keycode as i64 {
-            let mods_ok =
-                whimpr_core::hotkey_binding::modifiers_match(binding.modifiers, flags);
+            let mods_ok = whimpr_core::hotkey_binding::modifiers_match(binding.modifiers, flags);
             match etype {
                 K_CG_EVENT_KEY_DOWN if mods_ok => {
                     ptt_down(at_ms);
@@ -893,6 +1203,9 @@ mod imp {
                 eprintln!("[whimpr] no ASR model found");
             } else if let Ok(fallback) = whimpr_asr::FallbackEngine::new(engines) {
                 let engine: Arc<dyn AsrEngine> = Arc::new(fallback);
+                if let Err(error) = engine.set_language(&current_settings().dictation_language) {
+                    eprintln!("[whimpr] ASR language setup failed: {error}");
+                }
                 let id = engine.id();
                 let slot = ASR.get_or_init(|| RwLock::new(None));
                 if let Ok(mut current) = slot.write() {
@@ -920,8 +1233,6 @@ mod imp {
         let _ = MACHINE.set(Mutex::new(StateMachine::new()));
         let _ = CLOCK.set(Instant::now());
 
-        load_asr_model();
-
         // Load settings + dictionary, and build cloud providers from stored keys.
         let settings = whimpr_core::Settings::load(&settings_path());
         let dict = whimpr_core::DictionaryStore::load(&dict_path());
@@ -937,6 +1248,7 @@ mod imp {
         let _ = TRANSFORMS.set(Mutex::new(transforms));
         let _ = STATS.set(Mutex::new(whimpr_core::StatsStore::load(&stats_path())));
         rebuild_providers();
+        load_asr_model();
 
         // Start the local cleanup worker in the background (model load takes a few
         // seconds; the first local cleanup waits for it, subsequent ones are fast).
@@ -1021,8 +1333,9 @@ mod imp {
 pub use imp::{
     asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
     dictionary_learn, dictionary_remove, history, install, language_stats, load_asr_model,
-    rebuild_providers, sessions_for_analysis, snippet_add, snippet_remove, snippets_list, stats_summary,
-    transform_remove, transform_upsert, transforms_list, update_settings,
+    rebuild_providers, reload_local_worker, sessions_for_analysis, snippet_add, snippet_remove,
+    snippets_list, stats_summary, transform_remove, transform_upsert, transforms_list,
+    update_settings,
 };
 
 // Windows uses the real (but unverified) platform layer in `crate::win`.
@@ -1030,7 +1343,7 @@ pub use imp::{
 pub use crate::win::{
     asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
     dictionary_learn, dictionary_remove, history, install, load_asr_model, rebuild_providers,
-    sessions_for_analysis, stats_summary, update_settings,
+    reload_local_worker, sessions_for_analysis, stats_summary, update_settings,
 };
 
 // Other platforms (Linux, etc.): inert stubs so the crate still builds.
@@ -1046,6 +1359,7 @@ mod other {
     }
     pub fn update_settings(_new: whimpr_core::Settings) {}
     pub fn rebuild_providers() {}
+    pub fn reload_local_worker() {}
     pub fn stats_summary(tz_offset_minutes: i32) -> whimpr_core::StatsSummary {
         whimpr_core::StatsStore::default().summary(tz_offset_minutes, 0)
     }
@@ -1086,6 +1400,7 @@ mod other {
 pub use other::{
     asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
     dictionary_learn, dictionary_remove, history, install, language_stats, load_asr_model,
-    rebuild_providers, sessions_for_analysis, snippet_add, snippet_remove, snippets_list, stats_summary,
-    transform_remove, transform_upsert, transforms_list, update_settings,
+    rebuild_providers, reload_local_worker, sessions_for_analysis, snippet_add, snippet_remove,
+    snippets_list, stats_summary, transform_remove, transform_upsert, transforms_list,
+    update_settings,
 };

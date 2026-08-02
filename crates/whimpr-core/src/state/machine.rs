@@ -166,7 +166,8 @@ impl StateMachine {
                 if s == session =>
             {
                 self.state = DictationState::Idle;
-                vec![Action::ShowBar(BarState::Idle)]
+                // The shell owns the actionable error copy and its dismissal delay.
+                vec![]
             }
             _ => vec![],
         }

@@ -2,7 +2,7 @@
 //! [`whimpr_core::AsrEngine`]. Expects 16 kHz mono f32 samples.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use transcribe_rs::onnx::parakeet::ParakeetModel;
 use transcribe_rs::onnx::Quantization;
@@ -14,6 +14,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 /// A loaded whisper model ready to transcribe utterances.
 pub struct WhisperEngine {
     ctx: WhisperContext,
+    language: RwLock<String>,
 }
 
 impl WhisperEngine {
@@ -24,11 +25,22 @@ impl WhisperEngine {
             .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?;
         let ctx = WhisperContext::new_with_params(path, WhisperContextParameters::default())
             .map_err(|e| anyhow::anyhow!("failed to load whisper model: {e}"))?;
-        Ok(Self { ctx })
+        Ok(Self {
+            ctx,
+            language: RwLock::new("en".into()),
+        })
     }
 }
 
 impl AsrEngine for WhisperEngine {
+    fn set_language(&self, language: &str) -> anyhow::Result<()> {
+        *self
+            .language
+            .write()
+            .map_err(|_| anyhow::anyhow!("Whisper language lock poisoned"))? = language.to_string();
+        Ok(())
+    }
+
     fn id(&self) -> AsrEngineId {
         AsrEngineId::WhisperCpp
     }
@@ -46,7 +58,12 @@ impl AsrEngine for WhisperEngine {
             .map_err(|e| anyhow::anyhow!("whisper create_state: {e}"))?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(Some("en"));
+        let language = self
+            .language
+            .read()
+            .map_err(|_| anyhow::anyhow!("Whisper language lock poisoned"))?
+            .clone();
+        params.set_language(Some(&language));
         params.set_translate(false);
         params.set_print_special(false);
         params.set_print_progress(false);
@@ -85,6 +102,7 @@ impl AsrEngine for WhisperEngine {
 /// sessions and decoder state, so a mutex keeps the shared `AsrEngine` seam safe.
 pub struct ParakeetEngine {
     model: Mutex<ParakeetModel>,
+    language: RwLock<String>,
 }
 
 impl ParakeetEngine {
@@ -93,16 +111,31 @@ impl ParakeetEngine {
             .map_err(|e| anyhow::anyhow!("failed to load Parakeet model: {e}"))?;
         Ok(Self {
             model: Mutex::new(model),
+            language: RwLock::new("en".into()),
         })
     }
 }
 
 impl AsrEngine for ParakeetEngine {
+    fn set_language(&self, language: &str) -> anyhow::Result<()> {
+        *self
+            .language
+            .write()
+            .map_err(|_| anyhow::anyhow!("Parakeet language lock poisoned"))? =
+            language.to_string();
+        Ok(())
+    }
+
     fn id(&self) -> AsrEngineId {
         AsrEngineId::OnnxParakeet
     }
 
     fn transcribe(&self, pcm16k: &[f32]) -> anyhow::Result<Transcript> {
+        let language = self
+            .language
+            .read()
+            .map_err(|_| anyhow::anyhow!("Parakeet language lock poisoned"))?
+            .clone();
         let result = self
             .model
             .lock()
@@ -110,7 +143,7 @@ impl AsrEngine for ParakeetEngine {
             .transcribe(
                 pcm16k,
                 &TranscribeOptions {
-                    language: Some("en".into()),
+                    language: Some(language),
                     ..Default::default()
                 },
             )
@@ -138,6 +171,13 @@ impl FallbackEngine {
 }
 
 impl AsrEngine for FallbackEngine {
+    fn set_language(&self, language: &str) -> anyhow::Result<()> {
+        for engine in &self.engines {
+            engine.set_language(language)?;
+        }
+        Ok(())
+    }
+
     fn id(&self) -> AsrEngineId {
         self.engines[0].id()
     }
