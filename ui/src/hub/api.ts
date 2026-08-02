@@ -22,6 +22,8 @@ export interface Settings {
   ptt_hotkey: string;
   writing_style: WritingStyle;
   sound_on_start: boolean;
+  /** Pause Spotify/Music/browser media while dictating. */
+  pause_media_while_dictating: boolean;
 }
 
 export type WritingStyle = "default" | "formal" | "casual" | "very_casual" | "excited";
@@ -78,12 +80,13 @@ export const DEFAULT_SETTINGS: Settings = {
   openai_base_url: "",
   anthropic_model: "claude-haiku-4-5",
   ollama_base_url: "http://localhost:11434/v1",
-  ollama_model: "qwen3:1.7b",
+  ollama_model: "qwen3:8b",
   local_model: "",
   launch_at_login: false,
   ptt_hotkey: "option+w",
   writing_style: "default",
   sound_on_start: true,
+  pause_media_while_dictating: true,
 };
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {

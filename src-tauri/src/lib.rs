@@ -8,11 +8,15 @@
 
 mod appctx;
 mod autolearn;
+mod caret;
 mod hotkey;
 mod local_llm;
+mod media;
+mod overlay;
 mod paste;
 mod insights;
 mod services;
+mod sound;
 mod transforms;
 #[cfg(target_os = "windows")]
 mod win;
@@ -24,7 +28,8 @@ use tauri::{
     Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
-const OVERLAY_LABEL: &str = "whimpr_bar";
+use overlay::OVERLAY_LABEL;
+
 const HUB_LABEL: &str = "main";
 
 #[derive(Clone, Serialize)]
@@ -32,55 +37,8 @@ struct BarStatePayload {
     state: &'static str,
 }
 
-/// Anchor the overlay window bottom-center of its monitor.
-fn position_overlay(w: &WebviewWindow) {
-    // current_monitor() can be None before the window maps; fall back sensibly.
-    let monitor = w
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| w.current_monitor().ok().flatten())
-        .or_else(|| w.available_monitors().ok().and_then(|m| m.into_iter().next()));
-    let Some(monitor) = monitor else {
-        eprintln!("[whimpr] no monitor found — overlay stays at default position");
-        return;
-    };
-    let scale = monitor.scale_factor();
-    let msize = monitor.size();
-    let mpos = monitor.position();
-    let Ok(wsize) = w.outer_size() else { return };
-    let inset = (40.0 * scale) as i32;
-    let x = mpos.x + (msize.width as i32 - wsize.width as i32) / 2;
-    let y = mpos.y + msize.height as i32 - wsize.height as i32 - inset;
-    let _ = w.set_position(tauri::PhysicalPosition { x, y });
-    eprintln!(
-        "[whimpr] overlay placed: monitor {}x{} @({},{}) scale {:.1} -> window {}x{} @({},{})",
-        msize.width, msize.height, mpos.x, mpos.y, scale, wsize.width, wsize.height, x, y
-    );
-}
-
-fn build_overlay(app: &tauri::App) -> tauri::Result<WebviewWindow> {
-    let overlay = WebviewWindowBuilder::new(
-        app,
-        OVERLAY_LABEL,
-        WebviewUrl::App("overlay.html".into()),
-    )
-    .title("WhimprBar")
-    // Tight window so it only catches clicks right around the pill, not a big
-    // invisible box over the app behind it.
-    .inner_size(300.0, 72.0)
-    .decorations(false)
-    .transparent(true)
-    .shadow(false)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .focused(false)
-    .resizable(false)
-    .visible(true)
-    .build()?;
-    position_overlay(&overlay);
-    let _ = overlay.show();
-    Ok(overlay)
+fn build_overlay(app: &tauri::App) -> tauri::Result<tauri::WebviewWindow> {
+    overlay::build_overlay(app)
 }
 
 fn build_hub(app: &tauri::App) -> tauri::Result<WebviewWindow> {
@@ -93,6 +51,7 @@ fn build_hub(app: &tauri::App) -> tauri::Result<WebviewWindow> {
 }
 
 fn emit_bar_state(app: &tauri::AppHandle, state: &'static str) {
+    overlay::present(app);
     let _ = app.emit_to(OVERLAY_LABEL, "whimpr://flowbar/state", BarStatePayload { state });
 }
 
@@ -371,8 +330,12 @@ fn is_launch_at_login_enabled(app: tauri::AppHandle) -> Result<bool, String> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_autostart::Builder::new().build())
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_autostart::Builder::new().build());
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.plugin(tauri_nspanel::init());
+    }
+    builder
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,

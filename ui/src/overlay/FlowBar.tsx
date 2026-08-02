@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { palette, pillFill, geometry, font } from "../tokens/values";
+import { listen } from "@tauri-apps/api/event";
+import { palette, pillFill, geometry, font, motion } from "../tokens/values";
 
 // Visual states, mirroring the Rust `BarState`.
 export type BarState =
@@ -15,12 +16,7 @@ type StateEvent = { state: BarState; message?: string };
 type WaveformEvent = { bars: number[] };
 
 async function tauriListen<T>(event: string, cb: (payload: T) => void): Promise<() => void> {
-  try {
-    const { listen } = await import("@tauri-apps/api/event");
-    return await listen<T>(event, (e) => cb(e.payload as T));
-  } catch {
-    return () => {};
-  }
+  return listen<T>(event, (e) => cb(e.payload));
 }
 
 function Spinner() {
@@ -199,7 +195,7 @@ export function FlowBar() {
             : "");
 
   const dims = isIdle
-    ? { w: 76, h: 16 }
+    ? { w: 120, h: 32 }
     : recording
       ? { w: 250, h: 44 }
       : processing && slow
@@ -240,10 +236,10 @@ export function FlowBar() {
             display: "flex",
             alignItems: "center",
             justifyContent: recording ? "space-between" : "center",
-            gap: 10,
+            gap: isIdle ? 6 : 10,
             height: dims.h,
             width: dims.w,
-            padding: recording ? "0 8px" : processing || isError ? "0 14px" : 0,
+            padding: recording ? "0 8px" : processing || isError ? "0 14px" : isIdle ? "0 10px" : 0,
             background: pillFill.base,
             border: `1px solid ${borderColor}`,
             borderRadius: 9999,
@@ -255,7 +251,12 @@ export function FlowBar() {
           }}
         >
           {isIdle ? (
-            <IdleDot />
+            <>
+              <IdleDot />
+              <span style={{ fontSize: 11, color: palette.pillTextMuted, marginLeft: 6 }}>
+                Whimpr
+              </span>
+            </>
           ) : recording ? (
             <>
               <CancelButton />
@@ -283,4 +284,4 @@ export function FlowBar() {
   );
 }
 
-const motionEase = "cubic-bezier(0.05,0.6,0.4,0.95)";
+const motionEase = motion.ease;

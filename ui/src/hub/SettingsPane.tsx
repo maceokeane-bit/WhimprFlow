@@ -20,7 +20,13 @@ import {
   type Status,
 } from "./api";
 
-const DEFAULT_OLLAMA_MODEL = "qwen3:1.7b";
+const DEFAULT_OLLAMA_MODEL = "qwen3:8b";
+
+/** True if `tag` is installed — handles `model` vs `model:latest` aliases. */
+function ollamaModelInstalled(models: string[], tag: string): boolean {
+  if (models.includes(tag)) return true;
+  return models.some((m) => m.startsWith(`${tag}:`) || (tag.includes(":") && m.startsWith(`${tag.split(":")[0]}:`)));
+}
 
 const MODES: { value: CleanupMode; label: string; hint: string }[] = [
   { value: "raw", label: "Raw", hint: "Paste exactly what you said" },
@@ -197,8 +203,9 @@ function HotkeyPicker({
         )}
       </select>
       <div style={{ fontSize: 12, color: theme.textFaint, marginTop: 8, lineHeight: 1.5 }}>
-        Default is Option + W. Changes apply immediately — no restart. If the key doesn't respond,
-        grant Accessibility under Permissions below and relaunch once.
+        Default is Option + W. WhimprFlow suppresses that keystroke so it won't type ∑ or other
+        Option-letter symbols. Requires Accessibility — relaunch after granting if the hotkey
+        still types characters.
       </div>
     </div>
   );
@@ -228,8 +235,9 @@ function ServicesCard({
     return () => window.clearInterval(id);
   }, [refresh]);
 
-  const selectedInstalled =
-    services?.ollama_models.includes(settings.ollama_model) ?? false;
+  const selectedInstalled = services
+    ? ollamaModelInstalled(services.ollama_models, settings.ollama_model)
+    : false;
 
   const inputStyle = {
     width: "100%",
@@ -439,7 +447,8 @@ export function SettingsPane({
               }}
             />
             <div style={{ fontSize: 12, color: theme.textFaint, marginTop: 8 }}>
-              Pick your cleanup model in the Services section above. Avoid coder/reasoning models for dictation.
+              Avoid reasoning/coder models (deepseek-r1, qwen3-coder) for dictation cleanup.
+              qwen3:8b works well with Ollama.
             </div>
           </div>
         )}
@@ -583,6 +592,27 @@ export function SettingsPane({
             ]}
             value={settings.sound_on_start ? "on" : "off"}
             onChange={(v) => onChange({ ...settings, sound_on_start: v === "on" })}
+          />
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
+              Pause media while dictating
+            </div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2 }}>
+              Pauses Spotify, Music, and browser video when you start recording; resumes when you stop.
+            </div>
+          </div>
+          <Segmented
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
+            ]}
+            value={settings.pause_media_while_dictating ? "on" : "off"}
+            onChange={(v) => onChange({ ...settings, pause_media_while_dictating: v === "on" })}
           />
         </div>
       </Card>

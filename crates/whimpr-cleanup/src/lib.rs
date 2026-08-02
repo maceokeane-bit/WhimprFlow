@@ -1,7 +1,7 @@
-//! Cloud cleanup providers. The OpenAI provider (default cloud) sends the shared
-//! WhimprFlow system prompt plus the assembled context and returns cleaned text.
-//! On any failure the caller falls back to the raw transcript — cleanup is an
-//! enhancement, never a gate.
+//! Cloud cleanup providers implementing whimpr-core's CleanupProvider trait.
+//! OpenAI (default cloud) today; Anthropic and local llama layer in behind the trait.
+
+pub mod ollama;
 
 use std::time::Duration;
 
@@ -57,11 +57,16 @@ impl CleanupProvider for OpenAiProvider {
     }
 
     fn cleanup(&self, raw: &str, ctx: &CleanupContext) -> anyhow::Result<String> {
-        // System prompt + few-shot demonstration turns + the real transcript.
         let messages: Vec<serde_json::Value> = build_messages(raw, ctx)
             .into_iter()
             .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
             .collect();
+
+        // Qwen3 / DeepSeek-R1 reasoning models need Ollama's native API + think:false.
+        if ollama::is_local_ollama(&self.url) {
+            return ollama::chat(&self.url, &self.model, &messages);
+        }
+
         let body = serde_json::json!({
             "model": self.model,
             "temperature": 0.2,

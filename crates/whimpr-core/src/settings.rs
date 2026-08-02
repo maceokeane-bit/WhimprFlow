@@ -57,6 +57,13 @@ pub struct Settings {
     pub writing_style: WritingStyle,
     /// Play the record-start ping.
     pub sound_on_start: bool,
+    /// Pause Spotify/Music/browser media when dictation starts; resume when it stops.
+    #[serde(default = "default_pause_media_while_dictating")]
+    pub pause_media_while_dictating: bool,
+}
+
+fn default_pause_media_while_dictating() -> bool {
+    true
 }
 
 fn default_ollama_base_url() -> String {
@@ -64,8 +71,11 @@ fn default_ollama_base_url() -> String {
 }
 
 fn default_ollama_model() -> String {
-    "qwen3:1.7b".to_string()
+    "qwen3:8b".to_string()
 }
+
+/// Legacy default before we standardized on qwen3:8b for cleanup + insights.
+const LEGACY_OLLAMA_MODEL: &str = "qwen3:1.7b";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -82,16 +92,25 @@ impl Default for Settings {
             ptt_hotkey: crate::hotkey_binding::default_ptt_hotkey(),
             writing_style: WritingStyle::default(),
             sound_on_start: true,
+            pause_media_while_dictating: default_pause_media_while_dictating(),
         }
     }
 }
 
 impl Settings {
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut settings: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // One-time migration: older installs defaulted to the smaller tag.
+        if settings.ollama_model == LEGACY_OLLAMA_MODEL {
+            settings.ollama_model = default_ollama_model();
+            let _ = settings.save(path);
+        }
+
+        settings
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -122,5 +141,22 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.cleanup_mode, CleanupMode::Local);
+    }
+
+    #[test]
+    fn migrates_legacy_ollama_model_on_load() {
+        let dir = std::env::temp_dir().join(format!("whimpr-settings-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"cleanup_mode":"ollama","cleanup_level":"light","openai_model":"gpt-4o-mini","openai_base_url":"","anthropic_model":"claude-haiku-4-5","ollama_base_url":"http://localhost:11434/v1","ollama_model":"qwen3:1.7b","local_model":"","launch_at_login":false,"ptt_hotkey":"option+w","writing_style":"default","sound_on_start":true}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded.ollama_model, "qwen3:8b");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("qwen3:8b"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

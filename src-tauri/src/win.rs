@@ -88,6 +88,7 @@ fn now_ms() -> u64 {
 
 fn emit_bar(state: &'static str) {
     if let Some(app) = APP.get() {
+        crate::overlay::present(app);
         #[derive(Clone, serde::Serialize)]
         struct P {
             state: &'static str,

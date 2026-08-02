@@ -40,7 +40,7 @@ mod imp {
 
     const OVERLAY_LABEL: &str = "whimpr_bar";
 
-    // --- CoreGraphics / CoreFoundation FFI (listen-only Fn tap) -----------
+    // --- CoreGraphics / CoreFoundation FFI (session event tap; may swallow PTT keys) ---
     type CFMachPortRef = *mut c_void;
     type CFRunLoopSourceRef = *mut c_void;
     type CFRunLoopRef = *mut c_void;
@@ -81,7 +81,8 @@ mod imp {
 
     const K_CG_SESSION_EVENT_TAP: u32 = 1;
     const K_CG_HEAD_INSERT: u32 = 0;
-    const K_CG_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+    /// Default tap — can suppress keys so Option+W doesn't type ∑.
+    const K_CG_TAP_OPTION_DEFAULT: u32 = 0;
     const K_CG_EVENT_KEY_DOWN: u32 = 10;
     const K_CG_EVENT_KEY_UP: u32 = 11;
     const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
@@ -565,6 +566,7 @@ mod imp {
 
     fn emit_bar_msg(app: &AppHandle, state: &'static str, message: Option<String>) {
         eprintln!("[whimpr] pill -> {state}");
+        crate::overlay::present(app);
         let _ = app.emit_to(
             OVERLAY_LABEL,
             "whimpr://flowbar/state",
@@ -602,6 +604,11 @@ mod imp {
             // Start the microphone; stream real RMS bars to the pill waveform.
             // Runs off the tap thread so the mic-permission prompt can't stall keys.
             Action::StartCapture { .. } => {
+                if current_settings().pause_media_while_dictating {
+                    let _ = app.run_on_main_thread(|| {
+                        crate::media::on_dictation_start();
+                    });
+                }
                 let app_thread = app.clone();
                 std::thread::spawn(move || {
                     let app_cb = app_thread.clone();
@@ -621,6 +628,11 @@ mod imp {
             }
             // Stop the mic, transcribe the buffered audio, and advance the machine.
             Action::StopCaptureAndFinalize { session } => {
+                if current_settings().pause_media_while_dictating {
+                    let _ = app.run_on_main_thread(|| {
+                        crate::media::on_dictation_stop();
+                    });
+                }
                 let app2 = app.clone();
                 let handle = CAPTURE.get().and_then(|slot| slot.lock().unwrap().take());
                 std::thread::spawn(move || {
@@ -696,15 +708,25 @@ mod imp {
                 });
             }
             Action::DiscardCapture { .. } => {
+                if current_settings().pause_media_while_dictating {
+                    let _ = app.run_on_main_thread(|| {
+                        crate::media::on_dictation_stop();
+                    });
+                }
                 if let Some(slot) = CAPTURE.get() {
                     if let Some(handle) = slot.lock().unwrap().take() {
                         let _ = handle.stop();
                     }
                 }
             }
+            Action::PlayPing => {
+                if current_settings().sound_on_start {
+                    crate::sound::play_record_ping();
+                }
+            }
             // The ASR path (StopCaptureAndFinalize) now drives pipeline completion.
             Action::RunPipeline { .. } => {}
-            // PlayPing / WarnSessionCap: no-ops for now.
+            // WarnSessionCap: no-op for now.
             _ => {}
         }
     }
@@ -738,6 +760,11 @@ mod imp {
         }));
     }
 
+    /// Returning null from the tap callback drops the event so it never reaches apps.
+    fn swallow_event() -> CGEventRef {
+        null_mut()
+    }
+
     extern "C" fn tap_callback(
         _proxy: CGEventTapProxy,
         etype: u32,
@@ -758,10 +785,12 @@ mod imp {
             unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
         let flags = unsafe { CGEventGetFlags(event) };
 
-        // Esc cancels from any state.
+        // Esc cancels from any state (let Esc through so other apps still see it).
         if etype == K_CG_EVENT_KEY_DOWN && keycode == KEYCODE_ESC {
-            ptt_up(at_ms);
-            handle_input(Input::Trigger(TriggerToken::Cancel { at_ms }));
+            if PTT_HELD.load(Ordering::SeqCst) {
+                ptt_up(at_ms);
+                handle_input(Input::Trigger(TriggerToken::Cancel { at_ms }));
+            }
             return event;
         }
 
@@ -773,6 +802,7 @@ mod imp {
                 } else {
                     ptt_up(at_ms);
                 }
+                return swallow_event();
             }
             return event;
         }
@@ -787,17 +817,25 @@ mod imp {
                 } else {
                     ptt_up(at_ms);
                 }
+                return swallow_event();
             }
             return event;
         }
 
-        // Key + modifier combo (e.g. option+w).
+        // Key + modifier combo (e.g. option+w) — swallow so Option+letter doesn't type ∑, Ω, etc.
         if keycode == binding.keycode as i64 {
-            let mods_ok = whimpr_core::hotkey_binding::modifiers_match(binding.modifiers, flags);
-            if etype == K_CG_EVENT_KEY_DOWN && mods_ok {
-                ptt_down(at_ms);
-            } else if etype == K_CG_EVENT_KEY_UP {
-                ptt_up(at_ms);
+            let mods_ok =
+                whimpr_core::hotkey_binding::modifiers_match(binding.modifiers, flags);
+            match etype {
+                K_CG_EVENT_KEY_DOWN if mods_ok => {
+                    ptt_down(at_ms);
+                    return swallow_event();
+                }
+                K_CG_EVENT_KEY_UP if mods_ok || PTT_HELD.load(Ordering::SeqCst) => {
+                    ptt_up(at_ms);
+                    return swallow_event();
+                }
+                _ => {}
             }
         }
 
@@ -873,6 +911,14 @@ mod imp {
             handle_input(Input::Tick { now_ms: now_ms() });
         });
 
+        // Re-anchor the pill as focus / caret / composer height changes (Wispr-style).
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_millis(150));
+            if let Some(app) = APP.get() {
+                crate::overlay::present(app);
+            }
+        });
+
         // The event tap runs on a thread with its own CFRunLoop. CRITICAL: create it
         // ONLY after the process is trusted for Accessibility. macOS fixes a keyboard
         // tap's privilege at CGEventTapCreate time — a tap born untrusted is
@@ -883,12 +929,12 @@ mod imp {
             while !crate::paste::is_trusted() {
                 std::thread::sleep(Duration::from_millis(500));
             }
-            eprintln!("[whimpr] Accessibility present — creating global Fn tap");
+            eprintln!("[whimpr] Accessibility present — creating global PTT tap");
             let port = unsafe {
                 CGEventTapCreate(
                     K_CG_SESSION_EVENT_TAP,
                     K_CG_HEAD_INSERT,
-                    K_CG_TAP_OPTION_LISTEN_ONLY,
+                    K_CG_TAP_OPTION_DEFAULT,
                     EVENTS_OF_INTEREST,
                     tap_callback,
                     null_mut(),

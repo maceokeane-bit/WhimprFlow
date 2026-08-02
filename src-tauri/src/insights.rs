@@ -78,13 +78,6 @@ pub fn analyze(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let base = ollama_base.trim().trim_end_matches('/');
-    let url = if base.is_empty() {
-        "http://localhost:11434/v1/chat/completions".to_string()
-    } else {
-        format!("{base}/chat/completions")
-    };
-
     let system = "You analyze someone's dictated writing samples. Respond with ONLY valid JSON, no markdown fences.";
     let user = format!(
         r#"Analyze these dictated text samples from one person. Estimate:
@@ -104,16 +97,19 @@ JSON shape:
 
     let body = serde_json::json!({
         "model": ollama_model,
-        "temperature": 0.3,
-        "max_tokens": 600,
+        "think": false,
+        "stream": false,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
+        "options": {"temperature": 0.3, "num_predict": 600},
     });
 
+    let chat_url = whimpr_cleanup::ollama::native_chat_url(ollama_base);
+
     let out = std::process::Command::new("curl")
-        .args(["-sf", "--max-time", "120", "-X", "POST", &url])
+        .args(["-sf", "--max-time", "120", "-X", "POST", &chat_url])
         .arg("-H")
         .arg("Content-Type: application/json")
         .arg("-d")
@@ -123,8 +119,9 @@ JSON shape:
     match out {
         Ok(o) if o.status.success() => {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
-                let content = v["choices"][0]["message"]["content"]
+                let content = v["message"]["content"]
                     .as_str()
+                    .or_else(|| v["choices"][0]["message"]["content"].as_str())
                     .unwrap_or("")
                     .trim();
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {

@@ -41,6 +41,7 @@ windows = { version = "0.58", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }
 macos-accessibility-client = "0.0.1"
 # Frontmost-app detection (paste-target → per-app cleanup formatting). Already in
 # the tree via Tauri; declared here so we can call NSWorkspace directly.

@@ -11,6 +11,20 @@
 /// `com.apple.mail`. Returns `None` when it can't be determined or when
 /// WhimprFlow itself is frontmost (so we don't format for our own Hub window).
 #[cfg(target_os = "macos")]
+pub fn frontmost_pid() -> Option<i32> {
+    use objc2_app_kit::NSWorkspace;
+    unsafe {
+        let ws = NSWorkspace::sharedWorkspace();
+        let app = ws.frontmostApplication()?;
+        let bid = app.bundleIdentifier()?.to_string();
+        if bid == "com.whimpr.whimprflow" {
+            return None;
+        }
+        Some(app.processIdentifier())
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[allow(unused_unsafe)]
 pub fn frontmost_bundle_id() -> Option<String> {
     use objc2_app_kit::NSWorkspace;
@@ -26,6 +40,11 @@ pub fn frontmost_bundle_id() -> Option<String> {
     } else {
         Some(bid)
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn frontmost_pid() -> Option<i32> {
+    None
 }
 
 #[cfg(not(target_os = "macos"))]
