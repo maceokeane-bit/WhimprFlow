@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// Number of bars in the rolling waveform window (matches the pill's bar count).
-const WAVE_BARS: usize = 6;
+const WAVE_BARS: usize = 16;
 /// Emit the waveform at ~30 fps.
 const EMIT_INTERVAL: Duration = Duration::from_millis(33);
 /// Perceptual gain applied to raw RMS so speech fills the meter without clipping.
-const LEVEL_GAIN: f32 = 14.0;
+const LEVEL_GAIN: f32 = 20.0;
 
 /// The captured audio for one utterance.
 pub struct CaptureResult {

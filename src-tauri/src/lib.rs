@@ -25,17 +25,10 @@ use serde::Serialize;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
-use overlay::OVERLAY_LABEL;
-
 const HUB_LABEL: &str = "main";
-
-#[derive(Clone, Serialize)]
-struct BarStatePayload {
-    state: &'static str,
-}
 
 fn build_overlay(app: &tauri::App) -> tauri::Result<tauri::WebviewWindow> {
     overlay::build_overlay(app)
@@ -51,8 +44,7 @@ fn build_hub(app: &tauri::App) -> tauri::Result<WebviewWindow> {
 }
 
 fn emit_bar_state(app: &tauri::AppHandle, state: &'static str) {
-    overlay::present(app);
-    let _ = app.emit_to(OVERLAY_LABEL, "whimpr://flowbar/state", BarStatePayload { state });
+    overlay::emit_state(app, state, None);
 }
 
 #[tauri::command]
@@ -364,7 +356,8 @@ pub fn run() {
             request_microphone,
             request_accessibility,
             request_input_monitoring,
-            set_api_key
+            set_api_key,
+            overlay::get_overlay_snapshot
         ])
         .setup(|app| {
             // Regular app: shows in the Dock with a normal, focusable main window.

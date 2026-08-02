@@ -29,8 +29,7 @@ mod imp {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
-    use serde::Serialize;
-    use tauri::{AppHandle, Emitter};
+    use tauri::AppHandle;
     use whimpr_core::state::{Action, BarState};
     use whimpr_core::{
         AsrEngine, CleanupContext, CleanupMode, CleanupProvider, Input, PipelineEvent, StateMachine,
@@ -38,7 +37,6 @@ mod imp {
     };
     use whimpr_ipc::BindingId;
 
-    const OVERLAY_LABEL: &str = "whimpr_bar";
 
     // --- CoreGraphics / CoreFoundation FFI (session event tap; may swallow PTT keys) ---
     type CFMachPortRef = *mut c_void;
@@ -116,23 +114,6 @@ mod imp {
     static SNIPPETS: OnceLock<Mutex<whimpr_core::SnippetStore>> = OnceLock::new();
     static TRANSFORMS: OnceLock<Mutex<whimpr_core::TransformStore>> = OnceLock::new();
     static STATS: OnceLock<Mutex<whimpr_core::StatsStore>> = OnceLock::new();
-
-    #[derive(Clone, Serialize)]
-    struct BarPayload {
-        state: &'static str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
-    }
-
-    #[derive(Clone, Serialize)]
-    struct WavePayload {
-        bars: Vec<f32>,
-    }
-
-    #[derive(Clone, Serialize)]
-    struct TranscriptPayload {
-        text: String,
-    }
 
     /// The whisper ASR model to load: prefer the most accurate one present, in
     /// descending quality order, falling back to the small base model. Bigger
@@ -566,12 +547,7 @@ mod imp {
 
     fn emit_bar_msg(app: &AppHandle, state: &'static str, message: Option<String>) {
         eprintln!("[whimpr] pill -> {state}");
-        crate::overlay::present(app);
-        let _ = app.emit_to(
-            OVERLAY_LABEL,
-            "whimpr://flowbar/state",
-            BarPayload { state, message },
-        );
+        crate::overlay::emit_state(app, state, message);
     }
 
     /// Feed one input into the shared state machine and enact its actions.
@@ -613,11 +589,7 @@ mod imp {
                 std::thread::spawn(move || {
                     let app_cb = app_thread.clone();
                     match whimpr_audio::start(move |bars| {
-                        let _ = app_cb.emit_to(
-                            OVERLAY_LABEL,
-                            "whimpr://audio/waveform",
-                            WavePayload { bars: bars.to_vec() },
-                        );
+                        crate::overlay::emit_waveform(&app_cb, bars);
                     }) {
                         Ok(handle) => {
                             *CAPTURE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(handle);
@@ -693,11 +665,6 @@ mod imp {
                                     crate::autolearn::watch_correction(&text);
                                 }
                             }
-                            let _ = app2.emit_to(
-                                OVERLAY_LABEL,
-                                "whimpr://transcript",
-                                TranscriptPayload { text },
-                            );
                         }
                         Err(e) => {
                             eprintln!("[whimpr] ASR error: {e}");
@@ -909,14 +876,6 @@ mod imp {
         std::thread::spawn(|| loop {
             std::thread::sleep(Duration::from_millis(100));
             handle_input(Input::Tick { now_ms: now_ms() });
-        });
-
-        // Re-anchor the pill as focus / caret / composer height changes (Wispr-style).
-        std::thread::spawn(|| loop {
-            std::thread::sleep(Duration::from_millis(150));
-            if let Some(app) = APP.get() {
-                crate::overlay::present(app);
-            }
         });
 
         // The event tap runs on a thread with its own CFRunLoop. CRITICAL: create it

@@ -4,7 +4,7 @@
 pub fn play_record_ping() {
     std::thread::spawn(|| {
         #[cfg(target_os = "macos")]
-        mac::play_pop();
+        mac::play_ping();
         #[cfg(target_os = "windows")]
         win::play_beep();
     });
@@ -14,14 +14,14 @@ pub fn play_record_ping() {
 mod mac {
     use std::process::{Command, Stdio};
 
-    /// macOS built-in "Pop" — short, unobtrusive, no bundled asset needed.
-    const POP: &str = "/System/Library/Sounds/Pop.aiff";
+    /// macOS system "Ping" — the canonical short ping sound.
+    const PING: &str = "/System/Library/Sounds/Ping.aiff";
 
-    pub fn play_pop() {
+    pub fn play_ping() {
         let _ = Command::new("afplay")
             .arg("-v")
-            .arg("0.35")
-            .arg(POP)
+            .arg("1")
+            .arg(PING)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();

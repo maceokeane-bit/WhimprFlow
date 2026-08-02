@@ -1,21 +1,113 @@
-//! Flow Bar overlay — always-on-top, non-activating pill host.
+//! Flow Bar overlay — NSPanel on macOS for visibility on multi-monitor Retina setups.
 //!
-//! Fixed top-center placement (under the iMac notch / menu bar) on the monitor
-//! where the frontmost app lives. Avoids covering chat composers in Codex, Cursor, etc.
+//! Tauri events do not reliably reach panel webviews, so Rust keeps a live snapshot
+//! the overlay polls via `get_overlay_snapshot`. Events are still emitted as a backup.
 
+use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{
-    AppHandle, LogicalPosition, LogicalSize, Manager, Monitor, Position, Size, WebviewUrl,
-    WebviewWindow,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Monitor, Position, Size,
+    WebviewUrl, WebviewWindow,
 };
 #[cfg(not(target_os = "macos"))]
 use tauri::WebviewWindowBuilder;
 
 pub const OVERLAY_LABEL: &str = "whimpr_bar";
+pub const EVENT_STATE: &str = "whimpr://flowbar/state";
+pub const EVENT_WAVEFORM: &str = "whimpr://audio/waveform";
 
 const OVERLAY_W: f64 = 320.0;
 const OVERLAY_H: f64 = 80.0;
 /// Logical pt below the top of the monitor — sits in the notch divot on iMacs.
 const TOP_INSET: f64 = 52.0;
+const MIC_EMIT_THROTTLE_MS: u64 = 33;
+
+static LAST_MIC_EMIT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Latest pill UI — polled by the overlay webview (reliable with NSPanel).
+#[derive(Clone, Serialize, Default)]
+pub struct OverlaySnapshot {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub bars: Vec<f32>,
+}
+
+static SNAPSHOT: OnceLock<Mutex<OverlaySnapshot>> = OnceLock::new();
+
+fn snapshot_store() -> &'static Mutex<OverlaySnapshot> {
+    SNAPSHOT.get_or_init(|| {
+        Mutex::new(OverlaySnapshot {
+            state: "idle".into(),
+            message: None,
+            bars: Vec::new(),
+        })
+    })
+}
+
+#[tauri::command]
+pub fn get_overlay_snapshot() -> OverlaySnapshot {
+    snapshot_store().lock().unwrap().clone()
+}
+
+pub fn push_state(state: &str, message: Option<String>) {
+    {
+        let mut snap = snapshot_store().lock().unwrap();
+        snap.state = state.to_string();
+        snap.message = message;
+    }
+}
+
+pub fn push_waveform(bars: &[f32]) {
+    snapshot_store().lock().unwrap().bars = bars.to_vec();
+}
+
+pub fn emit_state(app: &AppHandle, state: &str, message: Option<String>) {
+    push_state(state, message.clone());
+    let _ = app.emit_to(
+        OVERLAY_LABEL,
+        EVENT_STATE,
+        StatePayload {
+            state,
+            message,
+        },
+    );
+    present(app);
+}
+
+pub fn emit_waveform(app: &AppHandle, bars: &[f32]) {
+    push_waveform(bars);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_MIC_EMIT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < MIC_EMIT_THROTTLE_MS {
+        return;
+    }
+    LAST_MIC_EMIT_MS.store(now, Ordering::Relaxed);
+    let _ = app.emit_to(
+        OVERLAY_LABEL,
+        EVENT_WAVEFORM,
+        WavePayload {
+            bars: bars.to_vec(),
+        },
+    );
+}
+
+#[derive(Clone, Serialize)]
+struct StatePayload<'a> {
+    state: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct WavePayload {
+    bars: Vec<f32>,
+}
 
 #[cfg(target_os = "macos")]
 use tauri_nspanel::ManagerExt;

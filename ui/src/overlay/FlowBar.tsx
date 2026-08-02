@@ -1,6 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { palette, pillFill, geometry, font, motion } from "../tokens/values";
+import { useEffect, useRef, useState, type MutableRefObject } from "react";
+import { palette, pillFill, geometry, font } from "../tokens/values";
 
 // Visual states, mirroring the Rust `BarState`.
 export type BarState =
@@ -15,8 +14,49 @@ export type BarState =
 type StateEvent = { state: BarState; message?: string };
 type WaveformEvent = { bars: number[] };
 
+type OverlaySnapshot = {
+  state: string;
+  message?: string | null;
+  bars: number[];
+};
+
+async function pollSnapshot(): Promise<OverlaySnapshot | null> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<OverlaySnapshot>("get_overlay_snapshot");
+  } catch {
+    return null;
+  }
+}
+
+function applySnapshot(
+  snap: OverlaySnapshot,
+  setState: (s: BarState) => void,
+  setMessage: (m: string | undefined) => void,
+  setBars: (b: number[]) => void,
+  transcribingSince: MutableRefObject<number | null>,
+  setSlow: (s: boolean) => void,
+) {
+  const next = snap.state as BarState;
+  setState(next);
+  setMessage(snap.message ?? undefined);
+  setBars(snap.bars);
+  if (next === "transcribing") {
+    transcribingSince.current = Date.now();
+    setSlow(false);
+  } else {
+    transcribingSince.current = null;
+    setSlow(false);
+  }
+}
+
 async function tauriListen<T>(event: string, cb: (payload: T) => void): Promise<() => void> {
-  return listen<T>(event, (e) => cb(e.payload));
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    return await listen<T>(event, (e) => cb(e.payload as T));
+  } catch {
+    return () => {};
+  }
 }
 
 function Spinner() {
@@ -27,7 +67,7 @@ function Spinner() {
         height: 14,
         borderRadius: "50%",
         border: "2px solid rgba(255,255,255,0.18)",
-        borderTopColor: palette.accent,
+        borderTopColor: palette.accent500,
         animation: "whimpr-spin 0.75s linear infinite",
         flex: "0 0 auto",
       }}
@@ -133,7 +173,7 @@ function IdleDot() {
         width: 8,
         height: 8,
         borderRadius: "50%",
-        background: palette.accent,
+        background: palette.accent500,
         boxShadow: `0 0 10px ${palette.accentGlow}`,
         opacity: 0.85,
         animation: "whimpr-pulse 2.4s ease-in-out infinite",
@@ -164,7 +204,22 @@ export function FlowBar() {
       }
     }).then((u) => (un1 = u));
     tauriListen<WaveformEvent>("whimpr://audio/waveform", (p) => setBars(p.bars)).then((u) => (un2 = u));
+
+    // NSPanel webviews don't receive Tauri events reliably — poll Rust snapshot.
+    let alive = true;
+    const tick = async () => {
+      if (!alive) return;
+      const snap = await pollSnapshot();
+      if (snap) {
+        applySnapshot(snap, setState, setMessage, setBars, transcribingSince, setSlow);
+      }
+    };
+    void tick();
+    const id = window.setInterval(tick, 33);
+
     return () => {
+      alive = false;
+      window.clearInterval(id);
       un1?.();
       un2?.();
     };
@@ -195,7 +250,7 @@ export function FlowBar() {
             : "");
 
   const dims = isIdle
-    ? { w: 120, h: 32 }
+    ? { w: 76, h: 16 }
     : recording
       ? { w: 250, h: 44 }
       : processing && slow
@@ -236,10 +291,10 @@ export function FlowBar() {
             display: "flex",
             alignItems: "center",
             justifyContent: recording ? "space-between" : "center",
-            gap: isIdle ? 6 : 10,
+            gap: 10,
             height: dims.h,
             width: dims.w,
-            padding: recording ? "0 8px" : processing || isError ? "0 14px" : isIdle ? "0 10px" : 0,
+            padding: recording ? "0 8px" : processing || isError ? "0 14px" : 0,
             background: pillFill.base,
             border: `1px solid ${borderColor}`,
             borderRadius: 9999,
@@ -251,12 +306,7 @@ export function FlowBar() {
           }}
         >
           {isIdle ? (
-            <>
-              <IdleDot />
-              <span style={{ fontSize: 11, color: palette.pillTextMuted, marginLeft: 6 }}>
-                Whimpr
-              </span>
-            </>
+            <IdleDot />
           ) : recording ? (
             <>
               <CancelButton />
@@ -284,4 +334,4 @@ export function FlowBar() {
   );
 }
 
-const motionEase = motion.ease;
+const motionEase = "cubic-bezier(0.05,0.6,0.4,0.95)";
