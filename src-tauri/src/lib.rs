@@ -141,6 +141,12 @@ fn show_flow_menu(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Polled by the Flow Bar overlay — reliable on macOS NSPanel where events drop.
+#[tauri::command]
+fn get_flow_bar_snap() -> overlay::FlowBarSnap {
+    overlay::snapshot()
+}
+
 #[tauri::command]
 fn get_settings() -> whimpr_core::Settings {
     hotkey::current_settings()
@@ -543,7 +549,7 @@ fn is_launch_at_login_enabled(app: tauri::AppHandle) -> Result<bool, String> {
 pub fn run() {
     // Only one process may own the global hotkey and overlay. Multiple instances
     // can otherwise stack identical pills while different processes receive Fn.
-    let mut builder = tauri::Builder::default()
+    tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(hub) = app.get_webview_window(HUB_LABEL) {
                 let _ = hub.show();
@@ -551,12 +557,7 @@ pub fn run() {
             }
             overlay::present(app);
         }))
-        .plugin(tauri_plugin_autostart::Builder::new().build());
-    #[cfg(target_os = "macos")]
-    {
-        builder = builder.plugin(tauri_nspanel::init());
-    }
-    builder
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,
@@ -596,6 +597,7 @@ pub fn run() {
             request_input_monitoring,
             relaunch_app,
             show_flow_menu,
+            get_flow_bar_snap,
             set_api_key
         ])
         .on_menu_event(handle_flow_menu_event)

@@ -699,8 +699,13 @@ export function SettingsPane({
 
       <Card style={{ marginBottom: 16 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
-            Play a sound when recording starts
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
+              Dictation sounds
+            </div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2 }}>
+              Ping on start, tink on release, pop when text is inserted.
+            </div>
           </div>
           <Segmented
             options={[

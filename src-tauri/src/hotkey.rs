@@ -26,6 +26,7 @@ mod imp {
     use std::path::PathBuf;
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+    use std::sync::mpsc::{self, Sender};
     use std::sync::{Arc, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 
@@ -101,6 +102,17 @@ mod imp {
     static COMMAND_PROCESSING: AtomicBool = AtomicBool::new(false);
     static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static BAR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    /// Work kicked off by the CGEventTap — must never run on the tap callback
+    /// thread or macOS disables the tap (Option+W then types ∑ into apps).
+    static TAP_TX: OnceLock<Sender<TapCmd>> = OnceLock::new();
+
+    enum TapCmd {
+        PttDown { at_ms: u64 },
+        PttUp { at_ms: u64 },
+        CommandDown,
+        CommandUp,
+        Cancel,
+    }
 
     static APP: OnceLock<AppHandle> = OnceLock::new();
     static MACHINE: OnceLock<Mutex<StateMachine>> = OnceLock::new();
@@ -693,6 +705,58 @@ mod imp {
         }
     }
 
+    /// Whisper often invents short "stage direction" lines on near-silence
+    /// (`*sad music*`, `[Silence]`, etc.). Reject those so we don't paste junk.
+    fn is_whisper_hallucination(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        // Asterisk / bracket stage directions: "*sad music*", "[Silence]".
+        if (trimmed.starts_with('*') && trimmed.ends_with('*') && trimmed.len() < 48)
+            || (trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() < 48)
+        {
+            return true;
+        }
+        let normalized = trimmed
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '*' | '"'
+                        | '\''
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
+                        | '.'
+                        | '!'
+                        | '?'
+                )
+            })
+            .trim()
+            .to_ascii_lowercase();
+        matches!(
+            normalized.as_str(),
+            "silence"
+                | "blank audio"
+                | "no audio"
+                | "inaudible"
+                | "music"
+                | "sad music"
+                | "applause"
+                | "laughing"
+                | "laughter"
+                | "coughing"
+                | "cough"
+                | "..."
+                | "…"
+        ) || (normalized.starts_with("music") && normalized.len() < 24)
+    }
+
     fn emit_bar(app: &AppHandle, state: &'static str) {
         emit_bar_msg(app, state, None);
     }
@@ -817,7 +881,7 @@ mod imp {
                 match result {
                     Ok(t) => {
                         let text = t.text.trim().to_string();
-                        if !text.is_empty() {
+                        if !text.is_empty() && !is_whisper_hallucination(&text) {
                             eprintln!("[whimpr] preview: \"{text}\"");
                             emit_partial(&app, &text);
                         }
@@ -950,6 +1014,9 @@ mod imp {
             // Stop the mic, transcribe the buffered audio, and advance the machine.
             Action::StopCaptureAndFinalize { session } => {
                 PREVIEW_GEN.fetch_add(1, Ordering::SeqCst);
+                if current_settings().sound_on_start {
+                    crate::sound::play_stop_ping();
+                }
                 if current_settings().pause_media_while_dictating {
                     let _ = app.run_on_main_thread(|| {
                         crate::media::on_dictation_stop();
@@ -1046,24 +1113,24 @@ mod imp {
                                 fail_pipeline(&app2, session, "We couldn't hear you");
                                 return;
                             }
-                            // Clean the transcript (cloud LLM if configured), then paste.
-                            if matches!(settings.cleanup_mode, CleanupMode::Raw)
-                                || settings.cleanup_level.bypasses_llm()
-                            {
-                                emit_bar_msg(
-                                    &app2,
-                                    "processing",
-                                    Some("Preparing…".into()),
+                            if is_whisper_hallucination(&raw) {
+                                eprintln!(
+                                    "[whimpr] dropping silence hallucination: \"{}\"",
+                                    raw.trim()
                                 );
-                            } else {
-                                emit_bar_msg(&app2, "formatting", Some("Cleaning up…".into()));
+                                unlink_audio(audio_path.as_deref());
+                                fail_pipeline(&app2, session, "We couldn't hear you");
+                                return;
                             }
+                            // Clean the transcript (cloud LLM if configured), then paste.
+                            // Keep the pill on a single clear processing state.
+                            emit_bar_msg(&app2, "transcribing", Some("Transcribing…".into()));
                             let text = clean_transcript(&raw);
                             if text != raw {
                                 eprintln!("[whimpr] CLEANED:   \"{}\"", text);
                             }
                             if !text.is_empty() {
-                                emit_bar_msg(&app2, "processing", Some("Inserting…".into()));
+                                emit_bar_msg(&app2, "transcribing", Some("Transcribing…".into()));
                                 if let Err(e) = crate::paste::paste_text(&text) {
                                     eprintln!("[whimpr] paste failed: {e}");
                                     unlink_audio(audio_path.as_deref());
@@ -1075,6 +1142,9 @@ mod imp {
                                     fail_pipeline(&app2, session, message);
                                     return;
                                 } else {
+                                    if current_settings().sound_on_start {
+                                        crate::sound::play_done_ping();
+                                    }
                                     record_dictation(
                                         &raw,
                                         &text,
@@ -1131,6 +1201,10 @@ mod imp {
         if PTT_HELD.swap(true, Ordering::SeqCst) {
             return;
         }
+        ptt_down_work(at_ms);
+    }
+
+    fn ptt_down_work(at_ms: u64) {
         eprintln!("[whimpr] PTT DOWN");
         let target = crate::appctx::frontmost_bundle_id();
         *TARGET_APP.get_or_init(|| Mutex::new(None)).lock().unwrap() = target;
@@ -1145,11 +1219,49 @@ mod imp {
         if !PTT_HELD.swap(false, Ordering::SeqCst) {
             return;
         }
+        ptt_up_work(at_ms);
+    }
+
+    fn ptt_up_work(at_ms: u64) {
         eprintln!("[whimpr] PTT UP");
         handle_input(Input::Trigger(TriggerToken::Up {
             binding: BindingId::PushToTalk,
             at_ms,
         }));
+    }
+
+    fn enqueue_tap(cmd: TapCmd) {
+        if let Some(tx) = TAP_TX.get() {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    fn start_tap_worker() {
+        let (tx, rx) = mpsc::channel::<TapCmd>();
+        let _ = TAP_TX.set(tx);
+        std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    TapCmd::PttDown { at_ms } => ptt_down_work(at_ms),
+                    TapCmd::PttUp { at_ms } => ptt_up_work(at_ms),
+                    TapCmd::CommandDown => command_down(),
+                    TapCmd::CommandUp => command_up(),
+                    TapCmd::Cancel => {
+                        if COMMAND_HELD.load(Ordering::SeqCst)
+                            || COMMAND_FINISHING.load(Ordering::SeqCst)
+                            || COMMAND_PROCESSING.load(Ordering::SeqCst)
+                        {
+                            command_cancel();
+                        }
+                        if PTT_HELD.swap(false, Ordering::SeqCst) {
+                            handle_input(Input::Trigger(TriggerToken::Cancel {
+                                at_ms: now_ms(),
+                            }));
+                        }
+                    }
+                }
+            }
+        });
     }
 
     fn command_down() {
@@ -1339,6 +1451,7 @@ mod imp {
         if etype == K_CG_TAP_DISABLED_BY_TIMEOUT || etype == K_CG_TAP_DISABLED_BY_USER_INPUT {
             let port = TAP_PORT.load(Ordering::SeqCst);
             if !port.is_null() {
+                eprintln!("[whimpr] event tap was disabled — re-enabling (prevents ∑ leak)");
                 unsafe { CGEventTapEnable(port, true) };
             }
             return event;
@@ -1351,16 +1464,13 @@ mod imp {
 
         // Esc cancels from any state (let Esc through so other apps still see it).
         if etype == K_CG_EVENT_KEY_DOWN && keycode == KEYCODE_ESC {
-            if COMMAND_HELD.load(Ordering::SeqCst)
+            let busy = COMMAND_HELD.load(Ordering::SeqCst)
                 || COMMAND_FINISHING.load(Ordering::SeqCst)
                 || COMMAND_PROCESSING.load(Ordering::SeqCst)
-            {
-                command_cancel();
+                || PTT_HELD.load(Ordering::SeqCst);
+            if busy {
+                enqueue_tap(TapCmd::Cancel);
                 return swallow_event();
-            }
-            if PTT_HELD.load(Ordering::SeqCst) {
-                ptt_up(at_ms);
-                handle_input(Input::Trigger(TriggerToken::Cancel { at_ms }));
             }
             return event;
         }
@@ -1377,11 +1487,11 @@ mod imp {
             let command_chord = flags & cmd_ctrl_opt == cmd_ctrl_opt
                 || (flags & fn_ctrl == fn_ctrl && (flags & FLAG_SECONDARY_FN) != 0);
             if command_chord {
-                command_down();
+                enqueue_tap(TapCmd::CommandDown);
                 return swallow_event();
             }
             if COMMAND_HELD.load(Ordering::SeqCst) {
-                command_up();
+                enqueue_tap(TapCmd::CommandUp);
                 return swallow_event();
             }
         }
@@ -1390,9 +1500,11 @@ mod imp {
             if etype == K_CG_EVENT_FLAGS_CHANGED && keycode == KEYCODE_FN {
                 let down = (flags & FLAG_SECONDARY_FN) != 0;
                 if down {
-                    ptt_down(at_ms);
-                } else {
-                    ptt_up(at_ms);
+                    if !PTT_HELD.swap(true, Ordering::SeqCst) {
+                        enqueue_tap(TapCmd::PttDown { at_ms });
+                    }
+                } else if PTT_HELD.swap(false, Ordering::SeqCst) {
+                    enqueue_tap(TapCmd::PttUp { at_ms });
                 }
                 return swallow_event();
             }
@@ -1405,9 +1517,11 @@ mod imp {
                 let down = (flags & whimpr_core::hotkey_binding::flags::ALT) != 0
                     || (flags & whimpr_core::hotkey_binding::flags::CONTROL) != 0;
                 if down {
-                    ptt_down(at_ms);
-                } else {
-                    ptt_up(at_ms);
+                    if !PTT_HELD.swap(true, Ordering::SeqCst) {
+                        enqueue_tap(TapCmd::PttDown { at_ms });
+                    }
+                } else if PTT_HELD.swap(false, Ordering::SeqCst) {
+                    enqueue_tap(TapCmd::PttUp { at_ms });
                 }
                 return swallow_event();
             }
@@ -1415,15 +1529,20 @@ mod imp {
         }
 
         // Key + modifier combo (e.g. option+w) — swallow so Option+letter doesn't type ∑, Ω, etc.
+        // Keep this path tiny: only atomics + channel send. Heavy work runs on the worker.
         if keycode == binding.keycode as i64 {
             let mods_ok = whimpr_core::hotkey_binding::modifiers_match(binding.modifiers, flags);
             match etype {
                 K_CG_EVENT_KEY_DOWN if mods_ok => {
-                    ptt_down(at_ms);
+                    if !PTT_HELD.swap(true, Ordering::SeqCst) {
+                        enqueue_tap(TapCmd::PttDown { at_ms });
+                    }
                     return swallow_event();
                 }
                 K_CG_EVENT_KEY_UP if mods_ok || PTT_HELD.load(Ordering::SeqCst) => {
-                    ptt_up(at_ms);
+                    if PTT_HELD.swap(false, Ordering::SeqCst) {
+                        enqueue_tap(TapCmd::PttUp { at_ms });
+                    }
                     return swallow_event();
                 }
                 _ => {}
@@ -1541,6 +1660,8 @@ mod imp {
             std::thread::sleep(Duration::from_millis(100));
             handle_input(Input::Tick { now_ms: now_ms() });
         });
+
+        start_tap_worker();
 
         // The event tap runs on a thread with its own CFRunLoop. CRITICAL: create it
         // ONLY after the process is trusted for Accessibility. macOS fixes a keyboard

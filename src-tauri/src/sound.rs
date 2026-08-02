@@ -1,12 +1,34 @@
 //! Short feedback sounds for dictation events.
+//!
+//! Three cues so you can follow the pipeline without watching the Flow Bar:
+//! 1. Start recording — Ping
+//! 2. Stop recording (key release) — Tink
+//! 3. Text pasted / done — Pop
 
-/// Play the record-start ping (respects nothing here — caller checks settings).
+/// Play the record-start ping (caller checks settings).
 pub fn play_record_ping() {
-    std::thread::spawn(|| {
+    play_named("Ping");
+}
+
+/// Play when push-to-talk is released and capture stops.
+pub fn play_stop_ping() {
+    play_named("Tink");
+}
+
+/// Play when cleanup finishes and text has been inserted.
+pub fn play_done_ping() {
+    play_named("Pop");
+}
+
+fn play_named(name: &'static str) {
+    std::thread::spawn(move || {
         #[cfg(target_os = "macos")]
-        mac::play_ping();
+        mac::play(name);
         #[cfg(target_os = "windows")]
-        win::play_beep();
+        {
+            let _ = name;
+            win::play_beep();
+        }
     });
 }
 
@@ -14,14 +36,18 @@ pub fn play_record_ping() {
 mod mac {
     use std::process::{Command, Stdio};
 
-    /// macOS system "Ping" — the canonical short ping sound.
-    const PING: &str = "/System/Library/Sounds/Ping.aiff";
-
-    pub fn play_ping() {
+    pub fn play(name: &str) {
+        let path = format!("/System/Library/Sounds/{name}.aiff");
+        // Slightly quieter stop/done so the start ping stays the loudest cue.
+        let volume = match name {
+            "Ping" => "1",
+            "Tink" => "0.85",
+            _ => "0.9",
+        };
         let _ = Command::new("afplay")
             .arg("-v")
-            .arg("1")
-            .arg(PING)
+            .arg(volume)
+            .arg(&path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
