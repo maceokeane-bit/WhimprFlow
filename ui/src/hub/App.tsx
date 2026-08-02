@@ -8,7 +8,6 @@ import { Home } from "./Home";
 import { Insights } from "./Insights";
 import { DictionaryPane } from "./DictionaryPane";
 import { SettingsPane } from "./SettingsPane";
-import { Help } from "./Help";
 import { SnippetsPane } from "./SnippetsPane";
 import { StylePane } from "./StylePane";
 import { TransformsPane } from "./TransformsPane";
@@ -114,7 +113,6 @@ export function App() {
           {page === "settings" && (
             <SettingsPane settings={settings} onChange={update} status={status} refresh={refresh} />
           )}
-          {page === "help" && <Help />}
           {soon && <ComingSoon icon={soon.icon} title={soon.title} desc={soon.desc} />}
         </div>
       </main>

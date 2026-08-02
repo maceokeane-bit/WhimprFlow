@@ -28,6 +28,18 @@ export interface Settings {
   sound_on_start: boolean;
   /** Pause Spotify/Music/browser media while dictating. */
   pause_media_while_dictating: boolean;
+  /** Hold Cmd+Ctrl+Option (or Fn+Ctrl) to run voice transforms. */
+  command_mode_enabled: boolean;
+  /** Persist dictation sessions in local history. */
+  store_history: boolean;
+  /** Auto-delete history older than N days; 0 = keep forever. */
+  history_retention_days: number;
+  /** Show rolling ASR preview while holding push-to-talk. */
+  live_preview_asr: boolean;
+  /** Pass caret-surrounding text into cleanup prompts. */
+  context_awareness: boolean;
+  /** Keep WAV audio for history sessions (pruned with retention). */
+  retain_audio: boolean;
 }
 
 export type WritingStyle = "default" | "formal" | "casual" | "very_casual" | "excited";
@@ -119,6 +131,12 @@ export const DEFAULT_SETTINGS: Settings = {
   writing_style: "default",
   sound_on_start: true,
   pause_media_while_dictating: true,
+  command_mode_enabled: true,
+  store_history: true,
+  history_retention_days: 14,
+  live_preview_asr: true,
+  context_awareness: true,
+  retain_audio: true,
 };
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -259,6 +277,7 @@ export interface HistoryItem {
   raw_text?: string;
   app: string | null;
   words: number;
+  has_audio?: boolean;
 }
 
 export async function getHistory(): Promise<HistoryItem[]> {
@@ -337,6 +356,26 @@ export async function deleteHistory(tsUnix: number): Promise<boolean> {
     return await invoke<boolean>("delete_history", { tsUnix });
   } catch {
     return false;
+  }
+}
+
+export async function clearHistory(): Promise<number> {
+  try {
+    return await invoke<number>("clear_history");
+  } catch {
+    return 0;
+  }
+}
+
+/** Returns a blob URL for retained dictation audio, or null. */
+export async function getHistoryAudioUrl(tsUnix: number): Promise<string | null> {
+  try {
+    const bytes = await invoke<number[]>("read_history_audio", { tsUnix });
+    if (!bytes?.length) return null;
+    const blob = new Blob([new Uint8Array(bytes)], { type: "audio/wav" });
+    return URL.createObjectURL(blob);
+  } catch {
+    return null;
   }
 }
 

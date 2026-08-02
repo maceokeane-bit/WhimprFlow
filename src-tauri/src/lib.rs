@@ -7,9 +7,11 @@
 //! `whimpr://flowbar/state`, so the tray demo items prove the event pipeline.
 
 mod appctx;
+mod audio_archive;
 mod autolearn;
 mod caret;
 mod cleanup_model_manager;
+mod context;
 mod hotkey;
 mod insights;
 mod local_llm;
@@ -367,6 +369,16 @@ fn delete_history(ts_unix: u64) -> bool {
 }
 
 #[tauri::command]
+fn clear_history() -> usize {
+    hotkey::clear_history()
+}
+
+#[tauri::command]
+fn read_history_audio(ts_unix: u64) -> Option<Vec<u8>> {
+    hotkey::history_audio(ts_unix)
+}
+
+#[tauri::command]
 fn analyze_insights(force_refresh: bool) -> insights::InsightReport {
     let settings = hotkey::current_settings();
     let sessions = hotkey::sessions_for_analysis(50);
@@ -566,6 +578,8 @@ pub fn run() {
             set_launch_at_login,
             is_launch_at_login_enabled,
             delete_history,
+            clear_history,
+            read_history_audio,
             analyze_insights,
             get_language_stats,
             get_snippets,

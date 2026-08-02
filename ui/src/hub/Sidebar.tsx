@@ -10,8 +10,7 @@ export type Page =
   | "style"
   | "transforms"
   | "scratchpad"
-  | "settings"
-  | "help";
+  | "settings";
 
 type NavDef = { key: Page; label: string; icon: IconName };
 
@@ -27,7 +26,6 @@ const MAIN: NavDef[] = [
 
 const BOTTOM: NavDef[] = [
   { key: "settings", label: "Settings", icon: "settings" },
-  { key: "help", label: "Help", icon: "help" },
 ];
 
 function NavItem({ item, active, onClick }: { item: NavDef; active: boolean; onClick: () => void }) {

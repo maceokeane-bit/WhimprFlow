@@ -231,6 +231,7 @@ fn record_dictation(text: &str, duration_secs: f32, app: Option<String>) {
             text.to_string(),
             text.to_string(),
             app,
+            None,
         );
         let _ = store.save(&stats_path());
     }
@@ -322,6 +323,7 @@ pub fn install(app: AppHandle) {
     let _ = OPENAI.set(Mutex::new(None));
     let _ = OLLAMA.set(Mutex::new(None));
     let _ = LOCAL.set(Mutex::new(None));
+    prune_history();
     rebuild_providers();
 
     // Load Whisper.
@@ -354,6 +356,7 @@ pub fn update_settings(new: whimpr_core::Settings) {
         *m.lock().unwrap() = new.clone();
     }
     let _ = new.save(&settings_path());
+    prune_history();
     rebuild_providers();
 }
 
@@ -410,11 +413,57 @@ pub fn delete_history(ts_unix: u64) -> bool {
         return false;
     };
     let mut store = m.lock().unwrap();
-    let ok = store.delete_at(ts_unix);
-    if ok {
+    if let Some(removed) = store.delete_at(ts_unix) {
+        if let Some(path) = removed.audio_path.as_deref() {
+            crate::audio_archive::delete_file(path);
+        }
+        let _ = store.save(&stats_path());
+        true
+    } else {
+        false
+    }
+}
+
+pub fn clear_history() -> usize {
+    let Some(m) = STATS.get() else {
+        return 0;
+    };
+    let mut store = m.lock().unwrap();
+    let removed = store.clear_all();
+    let count = removed.len();
+    for session in removed {
+        if let Some(path) = session.audio_path.as_deref() {
+            crate::audio_archive::delete_file(path);
+        }
+    }
+    if count > 0 {
         let _ = store.save(&stats_path());
     }
-    ok
+    count
+}
+
+pub fn prune_history() {
+    let settings = current_settings();
+    let Some(m) = STATS.get() else {
+        return;
+    };
+    let mut store = m.lock().unwrap();
+    let pruned = store.prune_older_than(settings.history_retention_days, unix_now());
+    if !pruned.is_empty() {
+        for session in pruned {
+            if let Some(path) = session.audio_path.as_deref() {
+                crate::audio_archive::delete_file(path);
+            }
+        }
+        let _ = store.save(&stats_path());
+    }
+}
+
+pub fn history_audio(ts_unix: u64) -> Option<Vec<u8>> {
+    let path = STATS
+        .get()
+        .and_then(|m| m.lock().unwrap().audio_path_for(ts_unix))?;
+    crate::audio_archive::read_bytes(&path)
 }
 
 pub fn sessions_for_analysis(limit: usize) -> Vec<(String, Option<String>)> {

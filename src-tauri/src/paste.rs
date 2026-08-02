@@ -105,14 +105,23 @@ mod imp {
     }
 
     fn policy_for_bundle(bundle_id: Option<&str>) -> InsertionPolicy {
-        match bundle_id.unwrap_or_default() {
+        let id = bundle_id.unwrap_or_default();
+        // Terminals + agent CLIs need small clipboard chunks or long pastes collapse.
+        if matches!(
+            id,
             "com.apple.Terminal"
-            | "com.googlecode.iterm2"
-            | "dev.warp.Warp-Stable"
-            | "com.mitchellh.ghostty"
-            | "com.microsoft.VSCode"
-            | "com.todesktop.230313mzl4w4u92" => InsertionPolicy::ChunkedClipboard,
-            _ => InsertionPolicy::AxPreferred,
+                | "com.googlecode.iterm2"
+                | "dev.warp.Warp-Stable"
+                | "com.mitchellh.ghostty"
+                | "com.microsoft.VSCode"
+                | "com.todesktop.230313mzl4w4u92" // Cursor
+                | "com.anthropic.claudefordesktop"
+        ) || id.starts_with("com.todesktop.")
+            || id.contains("claude")
+        {
+            InsertionPolicy::ChunkedClipboard
+        } else {
+            InsertionPolicy::AxPreferred
         }
     }
 

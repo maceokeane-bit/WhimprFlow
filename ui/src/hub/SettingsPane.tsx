@@ -4,6 +4,7 @@ import { theme } from "./theme";
 import { Button, Card, Dot, PageTitle, Segmented } from "./ui";
 import {
   cancelCleanupModelDownload,
+  clearHistory,
   getCleanupModelStatus,
   getServices,
   getHotkeyPresets,
@@ -23,6 +24,13 @@ import {
   type Settings,
   type Status,
 } from "./api";
+
+const RETENTION_OPTIONS: { value: number; label: string }[] = [
+  { value: 7, label: "7 days" },
+  { value: 14, label: "14 days" },
+  { value: 30, label: "30 days" },
+  { value: 0, label: "Forever" },
+];
 
 const DEFAULT_OLLAMA_MODEL = "qwen3:8b";
 const DICTATION_LANGUAGES = [
@@ -452,6 +460,9 @@ export function SettingsPane({
   status: Status;
   refresh: () => void;
 }) {
+  const [clearing, setClearing] = useState(false);
+  const [clearNote, setClearNote] = useState<string | null>(null);
+
   return (
     <div style={{ maxWidth: 720 }}>
       <PageTitle>Settings</PageTitle>
@@ -723,7 +734,7 @@ export function SettingsPane({
         </div>
       </Card>
 
-      <Card>
+      <Card style={{ marginBottom: 16 }}>
         <SectionTitle sub="Grant these to WhimprFlow, then quit and reopen the app if a dot stays grey.">
           Permissions
         </SectionTitle>
@@ -758,6 +769,191 @@ export function SettingsPane({
               requestInputMonitoring();
               setTimeout(refresh, 1000);
             }}
+          />
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 16 }}>
+        <SectionTitle sub="Speech-to-text always runs on this Mac. Cleanup stays local unless you pick a cloud engine.">
+          Data & Privacy
+        </SectionTitle>
+        <div style={{ fontSize: 13, color: theme.textMuted, lineHeight: 1.55, marginBottom: 16 }}>
+          Transcription always runs on this Mac. Optional retained WAVs stay in local app support and
+          are never uploaded. Cleanup uses Local GGUF or Ollama on-device by default; OpenAI / Anthropic
+          send only transcript text when you choose those engines. Keys live in your keychain.
+        </div>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            marginBottom: 14,
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
+              Store dictation history
+            </div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2 }}>
+              Saves sessions locally for Home and Insights. Off means new dictations aren’t kept.
+            </div>
+          </div>
+          <Segmented
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
+            ]}
+            value={settings.store_history ? "on" : "off"}
+            onChange={(v) => onChange({ ...settings, store_history: v === "on" })}
+          />
+        </div>
+        {settings.store_history && (
+          <>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                marginBottom: 14,
+              }}
+            >
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
+                  Keep dictation audio
+                </div>
+                <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2 }}>
+                  Saves a local WAV per session so you can replay mistakes. Pruned with history
+                  retention.
+                </div>
+              </div>
+              <Segmented
+                options={[
+                  { value: "on", label: "On" },
+                  { value: "off", label: "Off" },
+                ]}
+                value={settings.retain_audio ? "on" : "off"}
+                onChange={(v) => onChange({ ...settings, retain_audio: v === "on" })}
+              />
+            </div>
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontSize: 13, color: theme.textMuted, marginBottom: 8 }}>
+                Auto-delete history older than
+              </div>
+              <Segmented
+                options={RETENTION_OPTIONS.map((o) => ({
+                  value: String(o.value),
+                  label: o.label,
+                }))}
+                value={String(settings.history_retention_days)}
+                onChange={(v) =>
+                  onChange({ ...settings, history_retention_days: Number(v) })
+                }
+              />
+            </div>
+          </>
+        )}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            marginBottom: 14,
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
+              Context awareness
+            </div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2 }}>
+              Reads ~200 characters around the caret so cleanup can match tone and nearby names.
+            </div>
+          </div>
+          <Segmented
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
+            ]}
+            value={settings.context_awareness ? "on" : "off"}
+            onChange={(v) => onChange({ ...settings, context_awareness: v === "on" })}
+          />
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <Button
+            variant="ghost"
+            disabled={clearing}
+            onClick={async () => {
+              if (!window.confirm("Delete all local dictation history? This cannot be undone.")) {
+                return;
+              }
+              setClearing(true);
+              const removed = await clearHistory();
+              setClearing(false);
+              setClearNote(
+                removed > 0
+                  ? `Cleared ${removed} session${removed === 1 ? "" : "s"}.`
+                  : "History was already empty.",
+              );
+            }}
+          >
+            {clearing ? "Clearing…" : "Clear all history"}
+          </Button>
+          {clearNote && (
+            <span style={{ fontSize: 12.5, color: theme.textMuted }}>{clearNote}</span>
+          )}
+        </div>
+      </Card>
+
+      <Card>
+        <SectionTitle sub="Features that change how WhimprFlow behaves — easy to turn off.">
+          Experimental
+        </SectionTitle>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            marginBottom: 16,
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
+              Live transcript preview
+            </div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2, lineHeight: 1.5 }}>
+              Shows a rolling ASR preview in the Flow Bar while you hold push-to-talk. Final text
+              still comes from the full pass on release.
+            </div>
+          </div>
+          <Segmented
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
+            ]}
+            value={settings.live_preview_asr ? "on" : "off"}
+            onChange={(v) => onChange({ ...settings, live_preview_asr: v === "on" })}
+          />
+        </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
+              Command Mode
+            </div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2, lineHeight: 1.5 }}>
+              Hold <b>Command + Control + Option</b> (or <b>Fn + Control</b>) after selecting text to
+              speak a transform, or generate at the cursor with no selection.
+            </div>
+          </div>
+          <Segmented
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
+            ]}
+            value={settings.command_mode_enabled ? "on" : "off"}
+            onChange={(v) => onChange({ ...settings, command_mode_enabled: v === "on" })}
           />
         </div>
       </Card>

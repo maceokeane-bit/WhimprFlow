@@ -10,6 +10,7 @@
 //! dedicated thread; control flows over channels.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -45,6 +46,8 @@ impl CaptureResult {
 pub struct CaptureHandle {
     stop_tx: Sender<()>,
     join: Option<JoinHandle<Option<CaptureResult>>>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    sample_rate: Arc<AtomicU32>,
 }
 
 impl CaptureHandle {
@@ -52,6 +55,20 @@ impl CaptureHandle {
     pub fn stop(mut self) -> Option<CaptureResult> {
         let _ = self.stop_tx.send(());
         self.join.take().and_then(|h| h.join().ok().flatten())
+    }
+
+    /// Peek at the audio captured so far without stopping the mic.
+    /// Used for live-preview ASR while the user is still holding PTT.
+    pub fn snapshot(&self) -> Option<(Vec<f32>, u32)> {
+        let rate = self.sample_rate.load(Ordering::Relaxed);
+        if rate == 0 {
+            return None;
+        }
+        let samples = self.buffer.lock().ok()?.clone();
+        if samples.is_empty() {
+            return None;
+        }
+        Some((samples, rate))
     }
 }
 
@@ -76,6 +93,10 @@ where
 {
     let (stop_tx, stop_rx) = channel::<()>();
     let (ready_tx, ready_rx) = channel::<anyhow::Result<()>>();
+    let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let sample_rate_shared = Arc::new(AtomicU32::new(0));
+    let buffer_thread = buffer.clone();
+    let rate_thread = sample_rate_shared.clone();
 
     let join = std::thread::spawn(move || -> Option<CaptureResult> {
         let host = cpal::default_host();
@@ -98,9 +119,9 @@ where
         let sample_rate = supported.sample_rate().0;
         let channels = supported.channels().max(1) as usize;
         let config = supported.config();
+        rate_thread.store(sample_rate, Ordering::Relaxed);
 
-        let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
-        let buf_cb = buffer.clone();
+        let buf_cb = buffer_thread.clone();
 
         let mut ring: VecDeque<f32> = VecDeque::from(vec![0.0f32; WAVE_BARS]);
         let mut last_emit = Instant::now();
@@ -167,7 +188,7 @@ where
         let _ = stop_rx.recv();
         drop(stream);
 
-        let samples = std::mem::take(&mut *buffer.lock().unwrap());
+        let samples = std::mem::take(&mut *buffer_thread.lock().unwrap());
         Some(CaptureResult {
             samples,
             sample_rate,
@@ -178,6 +199,8 @@ where
         Ok(Ok(())) => Ok(CaptureHandle {
             stop_tx,
             join: Some(join),
+            buffer,
+            sample_rate: sample_rate_shared,
         }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow::anyhow!("capture thread exited before starting")),

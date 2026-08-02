@@ -204,6 +204,15 @@ pub fn dispatch_waveform(app: &AppHandle, bars: &[f32]) {
     );
 }
 
+pub fn dispatch_partial(app: &AppHandle, text: &str) {
+    dispatch_to_panel(
+        app,
+        "__WHIMPR_OVERLAY_PARTIAL__",
+        "whimpr:overlay-partial",
+        serde_json::json!({ "text": text }),
+    );
+}
+
 /// WebKit evaluation must happen on the macOS main thread. This bypasses the
 /// NSPanel event-channel limitation without sacrificing the panel's visibility.
 fn dispatch_to_panel(app: &AppHandle, global: &str, event: &str, payload: serde_json::Value) {

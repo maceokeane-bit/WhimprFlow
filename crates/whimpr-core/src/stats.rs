@@ -39,6 +39,9 @@ pub struct SessionRecord {
     /// Bundle id of the app the text was inserted into, if known.
     #[serde(default)]
     pub app: Option<String>,
+    /// Absolute path to a retained WAV of the utterance, if saved.
+    #[serde(default)]
+    pub audio_path: Option<String>,
 }
 
 /// A history row for the Hub Home list (newest first). Trimmed view of a record.
@@ -50,6 +53,9 @@ pub struct HistoryItem {
     pub raw_text: String,
     pub app: Option<String>,
     pub words: u32,
+    /// True when a retained audio file exists for this session.
+    #[serde(default)]
+    pub has_audio: bool,
 }
 
 /// The persisted stats log.
@@ -139,6 +145,7 @@ impl StatsStore {
         text: String,
         raw_text: String,
         app: Option<String>,
+        audio_path: Option<String>,
     ) {
         self.sessions.push(SessionRecord {
             ts_unix,
@@ -148,14 +155,42 @@ impl StatsStore {
             text,
             raw_text,
             app,
+            audio_path,
         });
     }
 
     /// Remove one session by timestamp (for history delete).
-    pub fn delete_at(&mut self, ts_unix: u64) -> bool {
-        let before = self.sessions.len();
-        self.sessions.retain(|s| s.ts_unix != ts_unix);
-        self.sessions.len() < before
+    pub fn delete_at(&mut self, ts_unix: u64) -> Option<SessionRecord> {
+        if let Some(pos) = self.sessions.iter().position(|s| s.ts_unix == ts_unix) {
+            Some(self.sessions.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// Remove every stored dictation. Returns the removed sessions (for audio cleanup).
+    pub fn clear_all(&mut self) -> Vec<SessionRecord> {
+        std::mem::take(&mut self.sessions)
+    }
+
+    /// Drop sessions older than `retention_days`. Returns the removed sessions.
+    /// `retention_days == 0` means keep forever.
+    pub fn prune_older_than(&mut self, retention_days: u32, now_unix: u64) -> Vec<SessionRecord> {
+        if retention_days == 0 {
+            return Vec::new();
+        }
+        let cutoff = now_unix.saturating_sub(u64::from(retention_days) * 86_400);
+        let mut kept = Vec::with_capacity(self.sessions.len());
+        let mut removed = Vec::new();
+        for session in self.sessions.drain(..) {
+            if session.ts_unix >= cutoff {
+                kept.push(session);
+            } else {
+                removed.push(session);
+            }
+        }
+        self.sessions = kept;
+        removed
     }
 
     /// The most recent `limit` dictations, newest first, for the Home history list.
@@ -171,8 +206,22 @@ impl StatsStore {
                 raw_text: s.raw_text.clone(),
                 app: s.app.clone(),
                 words: s.words,
+                has_audio: s
+                    .audio_path
+                    .as_deref()
+                    .map(|p| Path::new(p).exists())
+                    .unwrap_or(false),
             })
             .collect()
+    }
+
+    /// Absolute audio path for a session, if retained.
+    pub fn audio_path_for(&self, ts_unix: u64) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|s| s.ts_unix == ts_unix)
+            .and_then(|s| s.audio_path.clone())
+            .filter(|p| Path::new(p).exists())
     }
 
     /// Aggregate everything the dashboard shows. `now_unix` and `tz_offset_minutes`
@@ -355,12 +404,42 @@ mod tests {
     }
 
     #[test]
+    fn clears_and_prunes_history() {
+        let mut store = StatsStore::default();
+        store.record(
+            5,
+            1_000,
+            20,
+            NOW - DAY * 20,
+            "old".into(),
+            "old".into(),
+            None,
+            None,
+        );
+        store.record(
+            5,
+            1_000,
+            20,
+            NOW - DAY * 2,
+            "recent".into(),
+            "recent".into(),
+            None,
+            None,
+        );
+        assert_eq!(store.prune_older_than(14, NOW).len(), 1);
+        assert_eq!(store.sessions.len(), 1);
+        assert_eq!(store.clear_all().len(), 1);
+        assert!(store.sessions.is_empty());
+        assert!(store.prune_older_than(0, NOW).is_empty());
+    }
+
+    #[test]
     fn aggregates_totals_and_wpm() {
         let mut s = StatsStore::default();
         // 60 words in 60s -> 60 wpm.
-        s.record(60, 60_000, 300, NOW, String::new(), String::new(), None);
+        s.record(60, 60_000, 300, NOW, String::new(), String::new(), None, None);
         // 30 words in 15s -> 120 wpm.
-        s.record(30, 15_000, 150, NOW, String::new(), String::new(), None);
+        s.record(30, 15_000, 150, NOW, String::new(), String::new(), None, None);
         let sum = s.summary(0, NOW);
         assert_eq!(sum.total_words, 90);
         assert_eq!(sum.total_sessions, 2);
@@ -374,11 +453,11 @@ mod tests {
     fn streak_counts_consecutive_days_including_gap_today() {
         let mut s = StatsStore::default();
         // Activity yesterday, day-before, and three days ago (but NOT today).
-        s.record(10, 5_000, 50, NOW - DAY, String::new(), String::new(), None);
-        s.record(10, 5_000, 50, NOW - 2 * DAY, String::new(), String::new(), None);
-        s.record(10, 5_000, 50, NOW - 3 * DAY, String::new(), String::new(), None);
+        s.record(10, 5_000, 50, NOW - DAY, String::new(), String::new(), None, None);
+        s.record(10, 5_000, 50, NOW - 2 * DAY, String::new(), String::new(), None, None);
+        s.record(10, 5_000, 50, NOW - 3 * DAY, String::new(), String::new(), None, None);
         // Gap at 4 days ago, then one more.
-        s.record(10, 5_000, 50, NOW - 5 * DAY, String::new(), String::new(), None);
+        s.record(10, 5_000, 50, NOW - 5 * DAY, String::new(), String::new(), None, None);
         let sum = s.summary(0, NOW);
         // Today empty -> start at yesterday; 3 consecutive days back, then a gap.
         assert_eq!(sum.day_streak, 3);
@@ -388,8 +467,8 @@ mod tests {
     #[test]
     fn last7_buckets_by_local_day() {
         let mut s = StatsStore::default();
-        s.record(5, 3_000, 25, NOW, String::new(), String::new(), None); // today
-        s.record(7, 3_000, 35, NOW - 2 * DAY, String::new(), String::new(), None); // 2 days ago
+        s.record(5, 3_000, 25, NOW, String::new(), String::new(), None, None); // today
+        s.record(7, 3_000, 35, NOW - 2 * DAY, String::new(), String::new(), None, None); // 2 days ago
         let sum = s.summary(0, NOW);
         assert_eq!(sum.last7_words[6], 5); // today
         assert_eq!(sum.last7_words[4], 7); // two days ago

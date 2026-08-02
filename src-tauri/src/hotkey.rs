@@ -110,11 +110,16 @@ mod imp {
     /// Bundle id of the app that was frontmost at record-start = the paste target.
     /// Cleanup uses it to format for the medium (email vs. text vs. chat).
     static TARGET_APP: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    /// ~200 chars of caret context captured at PTT-down for cleanup prompts.
+    static WINDOW_CONTEXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     static CAPTURE: OnceLock<Mutex<Option<whimpr_audio::CaptureHandle>>> = OnceLock::new();
     static COMMAND_CAPTURE: OnceLock<Mutex<Option<whimpr_audio::CaptureHandle>>> = OnceLock::new();
     static ASR: OnceLock<RwLock<Option<Arc<dyn AsrEngine>>>> = OnceLock::new();
     static VAD: OnceLock<Arc<whimpr_asr::SileroVadTrimmer>> = OnceLock::new();
     static ASR_LOADING: AtomicBool = AtomicBool::new(false);
+    /// Bumped to cancel in-flight live-preview ASR loops.
+    static PREVIEW_GEN: AtomicU64 = AtomicU64::new(0);
+    static PREVIEW_BUSY: AtomicBool = AtomicBool::new(false);
     static OPENAI: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
     static OLLAMA: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
     static ANTHROPIC: OnceLock<Mutex<Option<whimpr_cleanup::AnthropicProvider>>> = OnceLock::new();
@@ -143,6 +148,11 @@ mod imp {
     #[derive(Clone, Serialize)]
     struct WavePayload {
         bars: Vec<f32>,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct PartialPayload {
+        text: String,
     }
 
     /// The whisper ASR model to load: prefer the most accurate one present, in
@@ -184,6 +194,15 @@ mod imp {
     fn stats_path() -> PathBuf {
         support_dir().join("stats.json")
     }
+    fn audio_dir() -> PathBuf {
+        support_dir().join("audio")
+    }
+
+    fn unlink_audio(path: Option<&str>) {
+        if let Some(path) = path {
+            crate::audio_archive::delete_file(path);
+        }
+    }
 
     /// Seconds since the Unix epoch (UTC), or 0 if the clock is before the epoch.
     fn unix_now() -> u64 {
@@ -195,9 +214,21 @@ mod imp {
 
     /// Log one completed dictation to the stats store (words, speaking time, text,
     /// target app) and persist it. Powers both the Hub stats and the history list.
-    pub fn record_dictation(raw: &str, cleaned: &str, duration_secs: f32) {
+    pub fn record_dictation(
+        raw: &str,
+        cleaned: &str,
+        duration_secs: f32,
+        ts_unix: u64,
+        audio_path: Option<String>,
+    ) {
+        let settings = current_settings();
+        if !settings.store_history {
+            unlink_audio(audio_path.as_deref());
+            return;
+        }
         let words = whimpr_core::stats::count_words(cleaned);
         if words == 0 {
+            unlink_audio(audio_path.as_deref());
             return;
         }
         let app = TARGET_APP.get().and_then(|m| m.lock().unwrap().clone());
@@ -209,11 +240,19 @@ mod imp {
                 words,
                 duration_ms,
                 chars,
-                unix_now(),
+                ts_unix,
                 cleaned.to_string(),
                 raw.to_string(),
                 app,
+                audio_path,
             );
+            let pruned = store.prune_older_than(settings.history_retention_days, unix_now());
+            if !pruned.is_empty() {
+                eprintln!("[whimpr] pruned {} expired history item(s)", pruned.len());
+                for session in pruned {
+                    unlink_audio(session.audio_path.as_deref());
+                }
+            }
             let _ = store.save(&stats_path());
         }
     }
@@ -231,11 +270,51 @@ mod imp {
             return false;
         };
         let mut store = m.lock().unwrap();
-        let ok = store.delete_at(ts_unix);
-        if ok {
+        if let Some(removed) = store.delete_at(ts_unix) {
+            unlink_audio(removed.audio_path.as_deref());
+            let _ = store.save(&stats_path());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_history() -> usize {
+        let Some(m) = STATS.get() else {
+            return 0;
+        };
+        let mut store = m.lock().unwrap();
+        let removed = store.clear_all();
+        let count = removed.len();
+        for session in removed {
+            unlink_audio(session.audio_path.as_deref());
+        }
+        if count > 0 {
             let _ = store.save(&stats_path());
         }
-        ok
+        count
+    }
+
+    pub fn prune_history() {
+        let settings = current_settings();
+        let Some(m) = STATS.get() else {
+            return;
+        };
+        let mut store = m.lock().unwrap();
+        let pruned = store.prune_older_than(settings.history_retention_days, unix_now());
+        if !pruned.is_empty() {
+            for session in pruned {
+                unlink_audio(session.audio_path.as_deref());
+            }
+            let _ = store.save(&stats_path());
+        }
+    }
+
+    pub fn history_audio(ts_unix: u64) -> Option<Vec<u8>> {
+        let path = STATS
+            .get()
+            .and_then(|m| m.lock().unwrap().audio_path_for(ts_unix))?;
+        crate::audio_archive::read_bytes(&path)
     }
 
     pub fn sessions_for_analysis(limit: usize) -> Vec<(String, Option<String>)> {
@@ -417,6 +496,7 @@ mod imp {
                 eprintln!("[whimpr] ASR language update failed: {error}");
             }
         }
+        prune_history();
         rebuild_providers();
     }
 
@@ -502,12 +582,25 @@ mod imp {
         if let Some(app) = app_bundle_id.as_deref() {
             eprintln!("[whimpr] cleanup target app: {app}");
         }
+        let window_context = if settings.context_awareness {
+            WINDOW_CONTEXT
+                .get()
+                .and_then(|m| m.lock().unwrap().clone())
+        } else {
+            None
+        };
+        if let Some(ctx) = window_context.as_deref() {
+            eprintln!(
+                "[whimpr] cleanup window context ({} chars)",
+                ctx.chars().count()
+            );
+        }
         let ctx = CleanupContext {
             level,
             vocab,
             app_bundle_id,
             writing_style: settings.writing_style,
-            ..Default::default()
+            window_context,
         };
         // Run the on-device model with the same prompt + per-app formatting.
         let run_local = || -> Option<anyhow::Result<String>> {
@@ -590,7 +683,8 @@ mod imp {
     fn bar_name(b: BarState) -> &'static str {
         match b {
             BarState::Idle => "idle",
-            BarState::Recording => "listening",
+            // Show the waveform shell immediately; mic bars fill in once capture starts.
+            BarState::Recording => "recording",
             BarState::Locked => "locked",
             BarState::Transcribing => "transcribing",
             BarState::Done => "done",
@@ -613,6 +707,128 @@ mod imp {
             "whimpr://flowbar/state",
             BarPayload { state, message },
         );
+    }
+
+    fn emit_partial(app: &AppHandle, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        crate::overlay::dispatch_partial(app, trimmed);
+        let _ = app.emit_to(
+            OVERLAY_LABEL,
+            "whimpr://flowbar/partial",
+            PartialPayload {
+                text: trimmed.to_string(),
+            },
+        );
+    }
+
+    fn capture_window_context_async() {
+        if !current_settings().context_awareness {
+            *WINDOW_CONTEXT.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
+            return;
+        }
+        *WINDOW_CONTEXT.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
+        std::thread::spawn(|| {
+            let ctx = crate::context::read_caret_context(100, 100);
+            if let Some(ref text) = ctx {
+                eprintln!(
+                    "[whimpr] caret context captured ({} chars)",
+                    text.chars().count()
+                );
+            }
+            *WINDOW_CONTEXT.get_or_init(|| Mutex::new(None)).lock().unwrap() = ctx;
+        });
+    }
+
+    fn start_live_preview(app: AppHandle, session: whimpr_core::SessionId) {
+        if !current_settings().live_preview_asr {
+            eprintln!("[whimpr] live preview off (Settings → Experimental)");
+            return;
+        }
+        let gen = PREVIEW_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        eprintln!("[whimpr] live preview started (gen {gen})");
+        std::thread::spawn(move || {
+            // Wait briefly so the mic buffer has something to score.
+            std::thread::sleep(Duration::from_millis(650));
+            loop {
+                if PREVIEW_GEN.load(Ordering::SeqCst) != gen {
+                    break;
+                }
+                let still_recording = MACHINE
+                    .get()
+                    .map(|machine| {
+                        matches!(
+                            machine.lock().unwrap().state(),
+                            whimpr_core::DictationState::Recording {
+                                session: current,
+                                ..
+                            } if current == session
+                        )
+                    })
+                    .unwrap_or(false);
+                if !still_recording {
+                    break;
+                }
+                if PREVIEW_BUSY.swap(true, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                let snapshot = CAPTURE
+                    .get()
+                    .and_then(|slot| slot.lock().ok()?.as_ref()?.snapshot());
+                let Some((samples, sample_rate)) = snapshot else {
+                    PREVIEW_BUSY.store(false, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
+                };
+                let pcm = whimpr_audio::resample_to_16k(&samples, sample_rate);
+                // Trailing ~4s keeps preview latency bounded on long holds.
+                const PREVIEW_SAMPLES: usize = 16_000 * 4;
+                let min_samples = 12_000; // ~0.75s
+                if pcm.len() < min_samples {
+                    PREVIEW_BUSY.store(false, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
+                let start = pcm.len().saturating_sub(PREVIEW_SAMPLES);
+                let chunk = &pcm[start..];
+                let peak = chunk.iter().fold(0f32, |m, &s| m.max(s.abs()));
+                if peak < 0.01 {
+                    PREVIEW_BUSY.store(false, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
+                let asr = ASR
+                    .get()
+                    .and_then(|slot| slot.read().ok()?.as_ref().cloned());
+                let Some(asr) = asr else {
+                    // Model still loading — keep trying instead of giving up.
+                    PREVIEW_BUSY.store(false, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                };
+                let result = asr.transcribe(chunk);
+                PREVIEW_BUSY.store(false, Ordering::SeqCst);
+                if PREVIEW_GEN.load(Ordering::SeqCst) != gen {
+                    break;
+                }
+                match result {
+                    Ok(t) => {
+                        let text = t.text.trim().to_string();
+                        if !text.is_empty() {
+                            eprintln!("[whimpr] preview: \"{text}\"");
+                            emit_partial(&app, &text);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[whimpr] preview ASR skipped: {error}");
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(450));
+            }
+        });
     }
 
     fn fail_pipeline(app: &AppHandle, session: whimpr_core::SessionId, message: &'static str) {
@@ -717,6 +933,7 @@ mod imp {
                                         "recording"
                                     },
                                 );
+                                start_live_preview(app_thread.clone(), session);
                             }
                         }
                         Err(e) => {
@@ -732,6 +949,7 @@ mod imp {
             }
             // Stop the mic, transcribe the buffered audio, and advance the machine.
             Action::StopCaptureAndFinalize { session } => {
+                PREVIEW_GEN.fetch_add(1, Ordering::SeqCst);
                 if current_settings().pause_media_while_dictating {
                     let _ = app.run_on_main_thread(|| {
                         crate::media::on_dictation_stop();
@@ -740,6 +958,13 @@ mod imp {
                 let app2 = app.clone();
                 let handle = CAPTURE.get().and_then(|slot| slot.lock().unwrap().take());
                 std::thread::spawn(move || {
+                    // Let a mid-flight preview finish so it releases the ASR lock.
+                    for _ in 0..40 {
+                        if !PREVIEW_BUSY.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
                     let Some(res) = handle.and_then(|h| h.stop()) else {
                         eprintln!("[whimpr] no audio captured");
                         fail_pipeline(&app2, session, "Microphone unavailable");
@@ -788,6 +1013,24 @@ mod imp {
                     } else {
                         pcm
                     };
+                    let settings = current_settings();
+                    let ts_unix = unix_now();
+                    let audio_path = if settings.store_history && settings.retain_audio && !pcm.is_empty()
+                    {
+                        let path = audio_dir().join(format!("{ts_unix}.wav"));
+                        match crate::audio_archive::write_wav(&path, &pcm) {
+                            Ok(p) => {
+                                eprintln!("[whimpr] retained audio {}", p.display());
+                                Some(p.to_string_lossy().into_owned())
+                            }
+                            Err(e) => {
+                                eprintln!("[whimpr] audio retain failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     match asr.transcribe(&pcm) {
                         Ok(t) => {
                             let mut raw = t.text;
@@ -799,30 +1042,31 @@ mod imp {
                             }
                             eprintln!("[whimpr] TRANSCRIPT: \"{}\"", raw);
                             if raw.trim().is_empty() {
+                                unlink_audio(audio_path.as_deref());
                                 fail_pipeline(&app2, session, "We couldn't hear you");
                                 return;
                             }
                             // Clean the transcript (cloud LLM if configured), then paste.
-                            let settings = current_settings();
                             if matches!(settings.cleanup_mode, CleanupMode::Raw)
                                 || settings.cleanup_level.bypasses_llm()
                             {
                                 emit_bar_msg(
                                     &app2,
                                     "processing",
-                                    Some("Preparing your text…".into()),
+                                    Some("Preparing…".into()),
                                 );
                             } else {
-                                emit_bar_msg(&app2, "formatting", Some("Using Polish".into()));
+                                emit_bar_msg(&app2, "formatting", Some("Cleaning up…".into()));
                             }
                             let text = clean_transcript(&raw);
                             if text != raw {
                                 eprintln!("[whimpr] CLEANED:   \"{}\"", text);
                             }
                             if !text.is_empty() {
-                                emit_bar_msg(&app2, "processing", Some("Inserting text…".into()));
+                                emit_bar_msg(&app2, "processing", Some("Inserting…".into()));
                                 if let Err(e) = crate::paste::paste_text(&text) {
                                     eprintln!("[whimpr] paste failed: {e}");
+                                    unlink_audio(audio_path.as_deref());
                                     let message = if e.to_string().contains("secure text fields") {
                                         "Dictation is disabled in password fields"
                                     } else {
@@ -831,20 +1075,30 @@ mod imp {
                                     fail_pipeline(&app2, session, message);
                                     return;
                                 } else {
-                                    record_dictation(&raw, &text, res.duration_secs());
+                                    record_dictation(
+                                        &raw,
+                                        &text,
+                                        res.duration_secs(),
+                                        ts_unix,
+                                        audio_path,
+                                    );
                                     crate::autolearn::watch_correction(&text);
                                 }
+                            } else {
+                                unlink_audio(audio_path.as_deref());
                             }
                             handle_input(Input::Pipeline(PipelineEvent::Committed { session }));
                         }
                         Err(e) => {
                             eprintln!("[whimpr] ASR error: {e}");
+                            unlink_audio(audio_path.as_deref());
                             fail_pipeline(&app2, session, "Something's not right");
                         }
                     }
                 });
             }
             Action::DiscardCapture { .. } => {
+                PREVIEW_GEN.fetch_add(1, Ordering::SeqCst);
                 if current_settings().pause_media_while_dictating {
                     let _ = app.run_on_main_thread(|| {
                         crate::media::on_dictation_stop();
@@ -880,6 +1134,7 @@ mod imp {
         eprintln!("[whimpr] PTT DOWN");
         let target = crate::appctx::frontmost_bundle_id();
         *TARGET_APP.get_or_init(|| Mutex::new(None)).lock().unwrap() = target;
+        capture_window_context_async();
         handle_input(Input::Trigger(TriggerToken::Down {
             binding: BindingId::PushToTalk,
             at_ms,
@@ -898,6 +1153,9 @@ mod imp {
     }
 
     fn command_down() {
+        if !current_settings().command_mode_enabled {
+            return;
+        }
         if PTT_HELD.load(Ordering::SeqCst)
             || COMMAND_PROCESSING.load(Ordering::SeqCst)
             || COMMAND_HELD.swap(true, Ordering::SeqCst)
@@ -909,6 +1167,7 @@ mod imp {
         eprintln!("[whimpr] COMMAND MODE DOWN");
         *TARGET_APP.get_or_init(|| Mutex::new(None)).lock().unwrap() =
             crate::appctx::frontmost_bundle_id();
+        capture_window_context_async();
         emit_bar(APP.get().expect("app installed"), "listening");
         let app = APP.get().expect("app installed").clone();
         std::thread::spawn(move || {
@@ -1247,6 +1506,7 @@ mod imp {
         let _ = SNIPPETS.set(Mutex::new(snippets));
         let _ = TRANSFORMS.set(Mutex::new(transforms));
         let _ = STATS.set(Mutex::new(whimpr_core::StatsStore::load(&stats_path())));
+        prune_history();
         rebuild_providers();
         load_asr_model();
 
@@ -1331,19 +1591,19 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
-    dictionary_learn, dictionary_remove, history, install, language_stats, load_asr_model,
-    rebuild_providers, reload_local_worker, sessions_for_analysis, snippet_add, snippet_remove,
-    snippets_list, stats_summary, transform_remove, transform_upsert, transforms_list,
-    update_settings,
+    asr_ready, clear_history, current_settings, delete_history, dictionary_add, dictionary_entries,
+    dictionary_learn, dictionary_remove, history, history_audio, install, language_stats,
+    load_asr_model, rebuild_providers, reload_local_worker, sessions_for_analysis, snippet_add,
+    snippet_remove, snippets_list, stats_summary, transform_remove, transform_upsert,
+    transforms_list, update_settings,
 };
 
 // Windows uses the real (but unverified) platform layer in `crate::win`.
 #[cfg(target_os = "windows")]
 pub use crate::win::{
-    asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
-    dictionary_learn, dictionary_remove, history, install, load_asr_model, rebuild_providers,
-    reload_local_worker, sessions_for_analysis, stats_summary, update_settings,
+    asr_ready, clear_history, current_settings, delete_history, dictionary_add, dictionary_entries,
+    dictionary_learn, dictionary_remove, history, history_audio, install, load_asr_model,
+    rebuild_providers, reload_local_worker, sessions_for_analysis, stats_summary, update_settings,
 };
 
 // Other platforms (Linux, etc.): inert stubs so the crate still builds.
@@ -1372,6 +1632,13 @@ mod other {
     pub fn delete_history(_ts_unix: u64) -> bool {
         false
     }
+    pub fn clear_history() -> usize {
+        0
+    }
+    pub fn prune_history() {}
+    pub fn history_audio(_ts_unix: u64) -> Option<Vec<u8>> {
+        None
+    }
     pub fn sessions_for_analysis(_limit: usize) -> Vec<(String, Option<String>)> {
         Vec::new()
     }
@@ -1398,9 +1665,9 @@ mod other {
 }
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use other::{
-    asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
-    dictionary_learn, dictionary_remove, history, install, language_stats, load_asr_model,
-    rebuild_providers, reload_local_worker, sessions_for_analysis, snippet_add, snippet_remove,
-    snippets_list, stats_summary, transform_remove, transform_upsert, transforms_list,
-    update_settings,
+    asr_ready, clear_history, current_settings, delete_history, dictionary_add, dictionary_entries,
+    dictionary_learn, dictionary_remove, history, history_audio, install, language_stats,
+    load_asr_model, rebuild_providers, reload_local_worker, sessions_for_analysis, snippet_add,
+    snippet_remove, snippets_list, stats_summary, transform_remove, transform_upsert,
+    transforms_list, update_settings,
 };

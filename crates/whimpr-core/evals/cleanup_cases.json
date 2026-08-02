@@ -1,0 +1,351 @@
+[
+  {
+    "id": "fillers_light_pass",
+    "category": "fillers",
+    "kind": "gate",
+    "level": "light",
+    "raw": "um so I I think we should uh basically just ship it like today",
+    "cleaned": "So I think we should just ship it today.",
+    "expect": "pass"
+  },
+  {
+    "id": "repetition_collapse_pass",
+    "category": "fillers",
+    "kind": "gate",
+    "level": "light",
+    "raw": "can you please please send the the deck over",
+    "cleaned": "Can you please send the deck over?",
+    "expect": "pass"
+  },
+  {
+    "id": "false_start_pass",
+    "category": "self_correction",
+    "kind": "gate",
+    "level": "light",
+    "raw": "let's meet on Tuesday actually let's meet on Thursday at noon",
+    "cleaned": "Let's meet on Thursday at noon.",
+    "expect": "pass"
+  },
+  {
+    "id": "scratch_that_pass",
+    "category": "self_correction",
+    "kind": "gate",
+    "level": "light",
+    "raw": "please send the report to Mark scratch that send the report to Rachel",
+    "cleaned": "Please send the report to Rachel.",
+    "expect": "pass"
+  },
+  {
+    "id": "no_wait_pass",
+    "category": "self_correction",
+    "kind": "gate",
+    "level": "light",
+    "raw": "book the room for monday no wait tuesday",
+    "cleaned": "Book the room for Tuesday.",
+    "expect": "pass"
+  },
+  {
+    "id": "mid_list_correction_pass",
+    "category": "self_correction",
+    "kind": "gate",
+    "level": "light",
+    "raw": "we need eggs milk uh no not milk we need oat milk and bread",
+    "cleaned": "We need eggs, oat milk, and bread.",
+    "expect": "pass"
+  },
+  {
+    "id": "emphasis_kept_pass",
+    "category": "guards",
+    "kind": "gate",
+    "level": "light",
+    "raw": "no no no that is definitely wrong",
+    "cleaned": "No, no, no, that is definitely wrong.",
+    "expect": "pass"
+  },
+  {
+    "id": "actually_intensifier_pass",
+    "category": "guards",
+    "kind": "gate",
+    "level": "light",
+    "raw": "i actually really liked the new design",
+    "cleaned": "I actually really liked the new design.",
+    "expect": "pass"
+  },
+  {
+    "id": "question_not_answered_pass",
+    "category": "guards",
+    "kind": "gate",
+    "level": "light",
+    "raw": "um can you send me the deck when you get a sec",
+    "cleaned": "Can you send me the deck when you get a sec?",
+    "expect": "pass"
+  },
+  {
+    "id": "question_answered_fail",
+    "category": "gates",
+    "kind": "gate",
+    "level": "light",
+    "raw": "what time is the standup",
+    "cleaned": "Here is the standup schedule: 9am.",
+    "expect": "fail",
+    "reason": "banned_pattern"
+  },
+  {
+    "id": "sure_prefix_fail",
+    "category": "gates",
+    "kind": "gate",
+    "level": "light",
+    "raw": "when is the board meeting",
+    "cleaned": "Sure, the board meeting is tomorrow at 10am.",
+    "expect": "fail",
+    "reason": "banned_pattern"
+  },
+  {
+    "id": "lost_account_id_fail",
+    "category": "gates",
+    "kind": "gate",
+    "level": "light",
+    "raw": "transfer 500 dollars to account 12345",
+    "cleaned": "Transfer money to the account.",
+    "expect": "fail",
+    "reason": "lost_entity"
+  },
+  {
+    "id": "lost_url_fail",
+    "category": "gates",
+    "kind": "gate",
+    "level": "light",
+    "raw": "check https://example.com/docs before merging",
+    "cleaned": "Check the docs before merging.",
+    "expect": "fail",
+    "reason": "lost_entity"
+  },
+  {
+    "id": "lost_email_fail",
+    "category": "gates",
+    "kind": "gate",
+    "level": "light",
+    "raw": "email alex@whimpr.dev about the launch",
+    "cleaned": "Email Alex about the launch.",
+    "expect": "fail",
+    "reason": "lost_entity"
+  },
+  {
+    "id": "keep_url_pass",
+    "category": "entities",
+    "kind": "gate",
+    "level": "light",
+    "raw": "check https://example.com/docs before merging",
+    "cleaned": "Check https://example.com/docs before merging.",
+    "expect": "pass"
+  },
+  {
+    "id": "over_deletion_fail",
+    "category": "gates",
+    "kind": "gate",
+    "level": "medium",
+    "raw": "the quarterly report is due on friday please review the budget section carefully",
+    "cleaned": "Report due Friday.",
+    "expect": "fail",
+    "reason": "over_deletion"
+  },
+  {
+    "id": "hallucination_growth_fail",
+    "category": "gates",
+    "kind": "gate",
+    "level": "light",
+    "raw": "ship it",
+    "cleaned": "Please ship it today after the standup, and ping the whole team on Slack once it is live so nobody is surprised.",
+    "expect": "fail",
+    "reason": "hallucination"
+  },
+  {
+    "id": "heavy_rewrite_light_fail",
+    "category": "gates",
+    "kind": "gate",
+    "level": "light",
+    "raw": "i went to the store and then i bought some milk and eggs and bread",
+    "cleaned": "Purchased dairy and bakery goods.",
+    "expect": "fail",
+    "reason": "edit_ratio"
+  },
+  {
+    "id": "mild_rewrite_light_pass",
+    "category": "fillers",
+    "kind": "gate",
+    "level": "light",
+    "raw": "i went to the store and then i bought some milk and eggs and bread",
+    "cleaned": "I went to the store and bought milk, eggs, and bread.",
+    "expect": "pass"
+  },
+  {
+    "id": "medium_tighten_keeps_room_pass",
+    "category": "levels",
+    "kind": "gate",
+    "level": "medium",
+    "raw": "um so basically i wanted to say that the meeting with jordan is at room 12b",
+    "cleaned": "The meeting with Jordan is in room 12B.",
+    "expect": "pass"
+  },
+  {
+    "id": "names_and_times_pass",
+    "category": "entities",
+    "kind": "gate",
+    "level": "light",
+    "raw": "hey can you ping alex at 4 30 about the whimprflow launch",
+    "cleaned": "Hey, can you ping Alex at 4:30 about the WhimprFlow launch?",
+    "expect": "pass"
+  },
+  {
+    "id": "emoji_preserved_pass",
+    "category": "guards",
+    "kind": "gate",
+    "level": "light",
+    "raw": "shipped the fix 🚀 thanks everyone",
+    "cleaned": "Shipped the fix 🚀 thanks everyone.",
+    "expect": "pass"
+  },
+  {
+    "id": "year_entity_kept_pass",
+    "category": "entities",
+    "kind": "gate",
+    "level": "light",
+    "raw": "target launch is 2026 after the beta",
+    "cleaned": "Target launch is 2026 after the beta.",
+    "expect": "pass"
+  },
+  {
+    "id": "year_entity_lost_fail",
+    "category": "gates",
+    "kind": "gate",
+    "level": "light",
+    "raw": "target launch is 2026 after the beta",
+    "cleaned": "Target launch is after the beta.",
+    "expect": "fail",
+    "reason": "lost_entity"
+  },
+  {
+    "id": "none_level_always_pass",
+    "category": "levels",
+    "kind": "gate",
+    "level": "none",
+    "raw": "anything goes here",
+    "cleaned": "totally different invented text",
+    "expect": "pass"
+  },
+  {
+    "id": "numbered_list_gold_pass",
+    "category": "lists",
+    "kind": "gate",
+    "level": "light",
+    "raw": "my top goals this week are one finish the report two send the presentation",
+    "cleaned": "My top goals this week are:\n1. Finish the report\n2. Send the presentation",
+    "expect": "pass"
+  },
+  {
+    "id": "bullets_gold_pass",
+    "category": "lists",
+    "kind": "gate",
+    "level": "light",
+    "raw": "grocery list bullet point milk bullet point eggs bullet point bread",
+    "cleaned": "Grocery list:\n- Milk\n- Eggs\n- Bread",
+    "expect": "pass"
+  },
+  {
+    "id": "post_process_new_line",
+    "category": "layout",
+    "kind": "post_process",
+    "raw": "line one new line line two",
+    "expect_cleaned": "line one\nline two"
+  },
+  {
+    "id": "post_process_new_paragraph",
+    "category": "layout",
+    "kind": "post_process",
+    "raw": "Para one. new paragraph Para two.",
+    "expect_cleaned": "Para one.\n\nPara two."
+  },
+  {
+    "id": "post_process_code_fence",
+    "category": "layout",
+    "kind": "post_process",
+    "raw": "```\nHello world\n```",
+    "expect_cleaned": "Hello world"
+  },
+  {
+    "id": "post_process_caps_blank_lines",
+    "category": "layout",
+    "kind": "post_process",
+    "raw": "a\n\n\n\nb",
+    "expect_cleaned": "a\n\nb"
+  },
+  {
+    "id": "post_process_leaves_actually",
+    "category": "layout",
+    "kind": "post_process",
+    "raw": "I actually liked it",
+    "expect_cleaned": "I actually liked it"
+  },
+  {
+    "id": "layout_pipeline_new_line",
+    "category": "layout",
+    "kind": "layout_pipeline",
+    "raw": "call me back at four thirty new line my desk number",
+    "expect_cleaned": "call me back at four thirty\nmy desk number"
+  },
+  {
+    "id": "layout_pipeline_new_paragraph",
+    "category": "layout",
+    "kind": "layout_pipeline",
+    "raw": "hey there new paragraph confirming friday",
+    "expect_cleaned": "hey there\n\nconfirming friday"
+  },
+  {
+    "id": "layout_pipeline_sentinel_restore",
+    "category": "layout",
+    "kind": "post_process",
+    "raw": "Send me the address [[NL]] and the gate code.",
+    "expect_cleaned": "Send me the address\nand the gate code."
+  },
+  {
+    "id": "assemble_includes_window_context",
+    "category": "context",
+    "kind": "assemble_includes",
+    "raw": "sounds good let's do thursday",
+    "window_context": "Looking forward to the launch sync next week with the design partners",
+    "app_bundle_id": "com.apple.mail",
+    "needle": "<WINDOW_CONTEXT>"
+  },
+  {
+    "id": "assemble_excludes_placeholder_ellipsis",
+    "category": "context",
+    "kind": "assemble_excludes",
+    "raw": "sounds good",
+    "window_context": "Reply to Alex...",
+    "needle": "<WINDOW_CONTEXT>"
+  },
+  {
+    "id": "assemble_excludes_short_placeholder",
+    "category": "context",
+    "kind": "assemble_excludes",
+    "raw": "sounds good",
+    "window_context": "Type here",
+    "needle": "<WINDOW_CONTEXT>"
+  },
+  {
+    "id": "assemble_includes_vocab",
+    "category": "vocab",
+    "kind": "assemble_includes",
+    "raw": "run cube cuttle against postgres",
+    "vocab_correct": "kubectl",
+    "vocab_mishears": ["cube cuttle", "kube cuddle"],
+    "needle": "<CUSTOM_VOCABULARY>"
+  },
+  {
+    "id": "assemble_wraps_transcript",
+    "category": "prompt",
+    "kind": "assemble_includes",
+    "raw": "hello team",
+    "needle": "<USER_MESSAGE>"
+  }
+]

@@ -65,7 +65,7 @@ export function TransformsPane() {
         <div style={{ fontSize: 13, color: theme.textMuted, marginTop: 5, lineHeight: 1.5 }}>
           Select text, hold <b>Command + Control + Option</b> (or <b>Fn + Control</b>), speak an
           instruction, then release. With no selection, WhimprFlow generates the requested content
-          at the cursor. Esc cancels.
+          at the cursor. Esc cancels. Disable under Settings → Experimental.
         </div>
       </Card>
 

@@ -19,10 +19,12 @@ export type BarState =
 
 type StateEvent = { state: BarState; message?: string };
 type WaveformEvent = { bars: number[] };
+type PartialEvent = { text: string };
 type OverlayBridgeWindow = Window &
   typeof globalThis & {
     __WHIMPR_OVERLAY_STATE__?: StateEvent;
     __WHIMPR_OVERLAY_WAVEFORM__?: WaveformEvent;
+    __WHIMPR_OVERLAY_PARTIAL__?: PartialEvent;
   };
 
 async function tauriListen<T>(event: string, cb: (payload: T) => void): Promise<() => void> {
@@ -162,27 +164,46 @@ export function FlowBar() {
   const [state, setState] = useState<BarState>("idle");
   const [message, setMessage] = useState<string | undefined>();
   const [bars, setBars] = useState<number[]>([]);
+  const [preview, setPreview] = useState("");
   const [slow, setSlow] = useState(false);
 
   useEffect(() => {
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
+    let un3: (() => void) | undefined;
 
     const applyState = (p: StateEvent) => {
       setState(p.state);
       setMessage(p.message);
+      // Keep preview across listening→recording; clear only when the hold ends.
+      if (
+        p.state !== "recording" &&
+        p.state !== "locked" &&
+        p.state !== "listening"
+      ) {
+        setPreview("");
+      }
     };
     const applyWaveform = (p: WaveformEvent) => setBars(p.bars);
+    const applyPartial = (p: PartialEvent) => {
+      if (p.text?.trim()) setPreview(p.text);
+    };
     const onPanelState = (event: Event) =>
       applyState((event as CustomEvent<StateEvent>).detail);
     const onPanelWaveform = (event: Event) =>
       applyWaveform((event as CustomEvent<WaveformEvent>).detail);
+    const onPanelPartial = (event: Event) =>
+      applyPartial((event as CustomEvent<PartialEvent>).detail);
 
     window.addEventListener("whimpr:overlay-state", onPanelState);
     window.addEventListener("whimpr:overlay-waveform", onPanelWaveform);
+    window.addEventListener("whimpr:overlay-partial", onPanelPartial);
     tauriListen<StateEvent>("whimpr://flowbar/state", applyState).then((u) => (un1 = u));
     tauriListen<WaveformEvent>("whimpr://audio/waveform", applyWaveform).then(
       (u) => (un2 = u),
+    );
+    tauriListen<PartialEvent>("whimpr://flowbar/partial", applyPartial).then(
+      (u) => (un3 = u),
     );
 
     // Main-thread Rust injection also stores the latest payload globally. Polling
@@ -190,6 +211,7 @@ export function FlowBar() {
     const bridge = window as OverlayBridgeWindow;
     let lastState = bridge.__WHIMPR_OVERLAY_STATE__;
     let lastWaveform = bridge.__WHIMPR_OVERLAY_WAVEFORM__;
+    let lastPartial = bridge.__WHIMPR_OVERLAY_PARTIAL__;
     const bridgePoll = window.setInterval(() => {
       if (bridge.__WHIMPR_OVERLAY_STATE__ !== lastState) {
         lastState = bridge.__WHIMPR_OVERLAY_STATE__;
@@ -199,14 +221,20 @@ export function FlowBar() {
         lastWaveform = bridge.__WHIMPR_OVERLAY_WAVEFORM__;
         if (lastWaveform) applyWaveform(lastWaveform);
       }
+      if (bridge.__WHIMPR_OVERLAY_PARTIAL__ !== lastPartial) {
+        lastPartial = bridge.__WHIMPR_OVERLAY_PARTIAL__;
+        if (lastPartial) applyPartial(lastPartial);
+      }
     }, 16);
 
     return () => {
       window.clearInterval(bridgePoll);
       window.removeEventListener("whimpr:overlay-state", onPanelState);
       window.removeEventListener("whimpr:overlay-waveform", onPanelWaveform);
+      window.removeEventListener("whimpr:overlay-partial", onPanelPartial);
       un1?.();
       un2?.();
+      un3?.();
     };
   }, []);
 
@@ -217,8 +245,8 @@ export function FlowBar() {
     return () => window.clearTimeout(id);
   }, [state]);
 
-  const recording = state === "recording" || state === "locked";
-  const listening = state === "listening";
+  const recording =
+    state === "recording" || state === "locked" || state === "listening";
   const isIdle = state === "idle";
   const processing = ["transcribing", "formatting", "processing"].includes(state);
   const isError = state === "error";
@@ -229,9 +257,9 @@ export function FlowBar() {
       : state === "transcribing"
         ? "Transcribing…"
         : state === "formatting"
-          ? "Using Polish"
+          ? "Cleaning up…"
           : state === "processing"
-            ? "Preparing your text…"
+            ? "Inserting…"
             : state === "listening" || state === "recording"
               ? "Listening…"
               : state === "locked"
@@ -246,12 +274,14 @@ export function FlowBar() {
                         ? "Done"
                         : "");
 
+  const previewText =
+    preview.length > 72 ? `${preview.slice(0, 69).trimEnd()}…` : preview;
   const dims = isIdle
     ? { w: 76, h: 16 }
-    : recording
-      ? { w: 250, h: 44 }
-      : listening
-        ? { w: 150, h: 36 }
+    : recording && previewText
+      ? { w: 360, h: 62 }
+      : recording
+        ? { w: 250, h: 44 }
       : processing && slow
         ? { w: 230, h: 38 }
         : processing
@@ -262,7 +292,7 @@ export function FlowBar() {
 
   const borderColor = isError
     ? "rgba(255,107,107,0.45)"
-    : recording || listening
+    : recording
       ? "rgba(34,195,182,0.35)"
       : "rgba(255,255,255,0.10)";
 
@@ -337,13 +367,28 @@ export function FlowBar() {
                 <CancelButton />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <DottedWaveform bars={bars} />
+                  {previewText && (
+                    <div
+                      style={{
+                        marginTop: 4,
+                        fontSize: 11.5,
+                        lineHeight: 1.25,
+                        color: palette.pillTextMuted,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        opacity: 0.92,
+                      }}
+                    >
+                      {previewText}
+                    </div>
+                  )}
                 </div>
                 <StopButton />
               </>
             ) : (
               <>
                 {processing && <Spinner />}
-                {listening && <IdleDot />}
                 {isError && <span aria-hidden="true">⚠</span>}
                 <span
                   style={{

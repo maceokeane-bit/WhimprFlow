@@ -3,7 +3,13 @@ import { font, palette } from "../tokens/values";
 import { theme } from "./theme";
 import { Card, useStats } from "./ui";
 import { Icon } from "./icons";
-import { getHistory, deleteHistory, type HistoryItem, type StatsSummary } from "./api";
+import {
+  getHistory,
+  deleteHistory,
+  getHistoryAudioUrl,
+  type HistoryItem,
+  type StatsSummary,
+} from "./api";
 import { dayKey, dayLabel, fmtCompact, fmtDuration, fmtNum, fmtTimeOfDay, wordsReference } from "./format";
 
 const UNLOCK_WORDS = 500;
@@ -86,6 +92,8 @@ function HistoryRow({
 }) {
   const d = new Date(item.ts_unix * 1000);
   const [showRaw, setShowRaw] = useState(false);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [loadingAudio, setLoadingAudio] = useState(false);
   const hasRaw = !!item.raw_text && item.raw_text !== item.text;
 
   return (
@@ -123,7 +131,35 @@ function HistoryRow({
               {showRaw ? "Show cleaned" : "Show raw"}
             </button>
           )}
+          {item.has_audio && !audioUrl && (
+            <button
+              onClick={async () => {
+                setLoadingAudio(true);
+                const url = await getHistoryAudioUrl(item.ts_unix);
+                setLoadingAudio(false);
+                if (url) setAudioUrl(url);
+              }}
+              style={{
+                border: "none",
+                background: "transparent",
+                cursor: "pointer",
+                fontFamily: font.ui,
+                fontSize: 11,
+                color: theme.accentDeep,
+                padding: 0,
+              }}
+            >
+              {loadingAudio ? "Loading…" : "Play audio"}
+            </button>
+          )}
         </div>
+        {audioUrl && (
+          <audio
+            controls
+            src={audioUrl}
+            style={{ width: "100%", maxWidth: 320, marginTop: 8, height: 28 }}
+          />
+        )}
       </div>
       <button
         title="Delete"

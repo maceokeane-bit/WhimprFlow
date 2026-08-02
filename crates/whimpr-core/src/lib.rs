@@ -22,7 +22,9 @@ pub mod transforms;
 pub mod types;
 
 pub use asr::{AsrEngine, AsrEngineId, Transcript};
-pub use cleanup::{CleanupContext, CleanupLevel, CleanupProvider, ProviderId, VocabEntry};
+pub use cleanup::{
+    run_eval, CleanupContext, CleanupLevel, CleanupProvider, EvalReport, ProviderId, VocabEntry,
+};
 pub use dictionary::{DictSource, DictionaryEntry, DictionaryStore};
 pub use hotkey_binding::{parse_hotkey, HotkeyBinding, PRESETS as HOTKEY_PRESETS};
 pub use settings::{CleanupMode, Settings};

@@ -72,9 +72,51 @@ pub struct Settings {
     /// Pause Spotify/Music/browser media when dictation starts; resume when it stops.
     #[serde(default = "default_pause_media_while_dictating")]
     pub pause_media_while_dictating: bool,
+    /// Enable Command Mode (hold Cmd+Ctrl+Option / Fn+Ctrl to transform text by voice).
+    #[serde(default = "default_command_mode_enabled")]
+    pub command_mode_enabled: bool,
+    /// Persist dictation history and stats on disk.
+    #[serde(default = "default_store_history")]
+    pub store_history: bool,
+    /// Auto-delete history older than N days. `0` keeps history forever.
+    #[serde(default = "default_history_retention_days")]
+    pub history_retention_days: u32,
+    /// Show rolling ASR preview text in the Flow Bar while holding PTT.
+    #[serde(default = "default_live_preview_asr")]
+    pub live_preview_asr: bool,
+    /// Feed ~200 chars of caret context into cleanup prompts.
+    #[serde(default = "default_context_awareness")]
+    pub context_awareness: bool,
+    /// Keep WAV audio for each history session (pruned with history retention).
+    #[serde(default = "default_retain_audio")]
+    pub retain_audio: bool,
 }
 
 fn default_pause_media_while_dictating() -> bool {
+    true
+}
+
+fn default_command_mode_enabled() -> bool {
+    true
+}
+
+fn default_store_history() -> bool {
+    true
+}
+
+fn default_history_retention_days() -> u32 {
+    14
+}
+
+fn default_live_preview_asr() -> bool {
+    true
+}
+
+fn default_context_awareness() -> bool {
+    true
+}
+
+fn default_retain_audio() -> bool {
     true
 }
 
@@ -117,6 +159,12 @@ impl Default for Settings {
             writing_style: WritingStyle::default(),
             sound_on_start: true,
             pause_media_while_dictating: default_pause_media_while_dictating(),
+            command_mode_enabled: default_command_mode_enabled(),
+            store_history: default_store_history(),
+            history_retention_days: default_history_retention_days(),
+            live_preview_asr: default_live_preview_asr(),
+            context_awareness: default_context_awareness(),
+            retain_audio: default_retain_audio(),
         }
     }
 }
@@ -156,6 +204,12 @@ mod tests {
         assert_eq!(s.cleanup_level, CleanupLevel::Light);
         assert_eq!(s.dictation_language, "en");
         assert!(!s.onboarding_complete);
+        assert!(s.command_mode_enabled);
+        assert!(s.store_history);
+        assert_eq!(s.history_retention_days, 14);
+        assert!(s.live_preview_asr);
+        assert!(s.context_awareness);
+        assert!(s.retain_audio);
     }
 
     #[test]

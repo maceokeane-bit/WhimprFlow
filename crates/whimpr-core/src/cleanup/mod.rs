@@ -6,10 +6,12 @@
 //! OpenAI client (default cloud, using the user's key), and an Anthropic client
 //! (option). All three send the byte-identical [`prompts::SYSTEM_PROMPT`].
 
+pub mod eval;
 pub mod gates;
 pub mod levels;
 pub mod prompts;
 
+pub use eval::{run_eval, EvalReport};
 pub use gates::{evaluate as evaluate_gates, GateReason, GateVerdict};
 pub use levels::CleanupLevel;
 
