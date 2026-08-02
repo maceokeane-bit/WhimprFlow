@@ -33,7 +33,9 @@ mod imp {
     type CFStringRef = *const c_void;
     type AXUIElementRef = *const c_void;
 
-    const K_AX_VALUE_CGRECT_TYPE: u32 = 5;
+    const K_AX_VALUE_CGPOINT_TYPE: u32 = 1;
+    const K_AX_VALUE_CGSIZE_TYPE: u32 = 2;
+    const K_AX_VALUE_CGRECT_TYPE: u32 = 3;
 
     #[repr(C)]
     struct CGPoint {
@@ -94,11 +96,7 @@ mod imp {
         value
     }
 
-    unsafe fn element_frame(element: AXUIElementRef) -> Option<ScreenRect> {
-        let frame = copy_attribute(element, "AXFrame");
-        if frame.is_null() {
-            return None;
-        }
+    unsafe fn read_rect(value: CFTypeRef) -> Option<CGRect> {
         let mut rect = CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: CGSize {
@@ -107,14 +105,71 @@ mod imp {
             },
         };
         if !AXValueGetValue(
-            frame,
+            value,
             K_AX_VALUE_CGRECT_TYPE,
             &mut rect as *mut CGRect as *mut c_void,
         ) {
-            CFRelease(frame);
             return None;
         }
-        CFRelease(frame);
+        Some(rect)
+    }
+
+    unsafe fn read_point(value: CFTypeRef) -> Option<CGPoint> {
+        let mut point = CGPoint { x: 0.0, y: 0.0 };
+        if !AXValueGetValue(
+            value,
+            K_AX_VALUE_CGPOINT_TYPE,
+            &mut point as *mut CGPoint as *mut c_void,
+        ) {
+            return None;
+        }
+        Some(point)
+    }
+
+    unsafe fn read_size(value: CFTypeRef) -> Option<CGSize> {
+        let mut size = CGSize {
+            width: 0.0,
+            height: 0.0,
+        };
+        if !AXValueGetValue(
+            value,
+            K_AX_VALUE_CGSIZE_TYPE,
+            &mut size as *mut CGSize as *mut c_void,
+        ) {
+            return None;
+        }
+        Some(size)
+    }
+
+    unsafe fn element_frame(element: AXUIElementRef) -> Option<ScreenRect> {
+        let frame = copy_attribute(element, "AXFrame");
+        let rect = if frame.is_null() {
+            None
+        } else {
+            let rect = read_rect(frame);
+            CFRelease(frame);
+            rect
+        }
+        .or_else(|| {
+            let position = copy_attribute(element, "AXPosition");
+            let size = copy_attribute(element, "AXSize");
+            let result = if position.is_null() || size.is_null() {
+                None
+            } else {
+                match (read_point(position), read_size(size)) {
+                    (Some(origin), Some(size)) => Some(CGRect { origin, size }),
+                    _ => None,
+                }
+            };
+            if !position.is_null() {
+                CFRelease(position);
+            }
+            if !size.is_null() {
+                CFRelease(size);
+            }
+            result
+        })?;
+
         if rect.size.width < 1.0 || rect.size.height < 1.0 {
             return None;
         }
@@ -141,9 +196,11 @@ mod imp {
                     continue;
                 }
                 let frame = element_frame(win as AXUIElementRef);
-                CFRelease(app);
                 CFRelease(win);
-                return frame;
+                if frame.is_some() {
+                    CFRelease(app);
+                    return frame;
+                }
             }
             CFRelease(app);
             None

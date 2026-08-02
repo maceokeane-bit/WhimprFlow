@@ -1,4 +1,4 @@
-//! Local service health + controls (Ollama, Whisper model on disk, GGUF backup).
+//! Local service health + controls (Ollama, ASR model on disk, GGUF backup).
 
 use serde::Serialize;
 use std::path::PathBuf;
@@ -12,24 +12,30 @@ pub struct ServicesStatus {
     pub ollama_running: bool,
     /// Tags returned by `ollama list` / /api/tags (empty if Ollama is down).
     pub ollama_models: Vec<String>,
-    /// Whisper .bin file present on disk.
-    pub whisper_ready: bool,
-    pub whisper_model: Option<String>,
+    /// Primary or fallback ASR model present on disk.
+    pub asr_ready: bool,
+    pub asr_model: Option<String>,
     /// GGUF cleanup backup present on disk.
     pub gguf_ready: bool,
     pub gguf_model: Option<String>,
     /// llama.cpp worker binary built and findable.
     pub local_worker_ready: bool,
     /// Speech model loaded in memory (WhimprFlow must be running).
-    pub whisper_loaded: bool,
+    pub asr_loaded: bool,
 }
 
 fn models_dir() -> PathBuf {
     local_llm::app_support_dir().join("models")
 }
 
-fn whisper_on_disk() -> Option<String> {
+fn asr_on_disk() -> Option<String> {
     let dir = models_dir();
+    if dir
+        .join("parakeet-tdt-0.6b-v3-int8/encoder-model.int8.onnx")
+        .exists()
+    {
+        return Some("Parakeet TDT 0.6B v3 (int8)".into());
+    }
     for name in [
         "ggml-large-v3-turbo.bin",
         "ggml-medium.en.bin",
@@ -69,9 +75,9 @@ pub fn ollama_status() -> (bool, Vec<String>) {
     (true, models)
 }
 
-pub fn status(whisper_loaded: bool) -> ServicesStatus {
+pub fn status(asr_loaded: bool) -> ServicesStatus {
     let (ollama_running, ollama_models) = ollama_status();
-    let whisper_model = whisper_on_disk();
+    let asr_model = asr_on_disk();
     let gguf_path = local_llm::model_path();
     let gguf_model = gguf_path
         .as_ref()
@@ -80,12 +86,12 @@ pub fn status(whisper_loaded: bool) -> ServicesStatus {
     ServicesStatus {
         ollama_running,
         ollama_models,
-        whisper_ready: whisper_model.is_some(),
-        whisper_model,
+        asr_ready: asr_model.is_some(),
+        asr_model,
         gguf_ready: gguf_path.is_some(),
         gguf_model,
         local_worker_ready: local_llm::worker_bin_path().is_some(),
-        whisper_loaded,
+        asr_loaded,
     }
 }
 

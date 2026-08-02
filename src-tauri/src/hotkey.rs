@@ -26,10 +26,11 @@ mod imp {
     use super::DictEntryDto;
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 
-    use tauri::AppHandle;
+    use serde::Serialize;
+    use tauri::{AppHandle, Emitter};
     use whimpr_core::state::{Action, BarState};
     use whimpr_core::{
         AsrEngine, CleanupContext, CleanupMode, CleanupProvider, Input, PipelineEvent, StateMachine,
@@ -37,6 +38,7 @@ mod imp {
     };
     use whimpr_ipc::BindingId;
 
+    const OVERLAY_LABEL: &str = "whimpr_bar";
 
     // --- CoreGraphics / CoreFoundation FFI (session event tap; may swallow PTT keys) ---
     type CFMachPortRef = *mut c_void;
@@ -104,7 +106,9 @@ mod imp {
     /// Cleanup uses it to format for the medium (email vs. text vs. chat).
     static TARGET_APP: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     static CAPTURE: OnceLock<Mutex<Option<whimpr_audio::CaptureHandle>>> = OnceLock::new();
-    static ASR: OnceLock<Arc<whimpr_asr::WhisperEngine>> = OnceLock::new();
+    static ASR: OnceLock<RwLock<Option<Arc<dyn AsrEngine>>>> = OnceLock::new();
+    static VAD: OnceLock<Arc<whimpr_asr::SileroVadTrimmer>> = OnceLock::new();
+    static ASR_LOADING: AtomicBool = AtomicBool::new(false);
     static OPENAI: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
     static OLLAMA: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
     static ANTHROPIC: OnceLock<Mutex<Option<whimpr_cleanup::AnthropicProvider>>> = OnceLock::new();
@@ -114,6 +118,18 @@ mod imp {
     static SNIPPETS: OnceLock<Mutex<whimpr_core::SnippetStore>> = OnceLock::new();
     static TRANSFORMS: OnceLock<Mutex<whimpr_core::TransformStore>> = OnceLock::new();
     static STATS: OnceLock<Mutex<whimpr_core::StatsStore>> = OnceLock::new();
+
+    #[derive(Clone, Serialize)]
+    struct BarPayload {
+        state: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct WavePayload {
+        bars: Vec<f32>,
+    }
 
     /// The whisper ASR model to load: prefer the most accurate one present, in
     /// descending quality order, falling back to the small base model. Bigger
@@ -547,7 +563,13 @@ mod imp {
 
     fn emit_bar_msg(app: &AppHandle, state: &'static str, message: Option<String>) {
         eprintln!("[whimpr] pill -> {state}");
-        crate::overlay::emit_state(app, state, message);
+        crate::overlay::present(app);
+        crate::overlay::dispatch_state(app, state, message.clone());
+        let _ = app.emit_to(
+            OVERLAY_LABEL,
+            "whimpr://flowbar/state",
+            BarPayload { state, message },
+        );
     }
 
     /// Feed one input into the shared state machine and enact its actions.
@@ -589,9 +611,17 @@ mod imp {
                 std::thread::spawn(move || {
                     let app_cb = app_thread.clone();
                     match whimpr_audio::start(move |bars| {
-                        crate::overlay::emit_waveform(&app_cb, bars);
+                        crate::overlay::dispatch_waveform(&app_cb, bars);
+                        let _ = app_cb.emit_to(
+                            OVERLAY_LABEL,
+                            "whimpr://audio/waveform",
+                            WavePayload {
+                                bars: bars.to_vec(),
+                            },
+                        );
                     }) {
                         Ok(handle) => {
+                            eprintln!("[whimpr] mic capture started — waveform active");
                             *CAPTURE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(handle);
                         }
                         Err(e) => eprintln!("[whimpr] mic capture failed to start: {e}"),
@@ -631,12 +661,32 @@ mod imp {
                              Security → Microphone), then fully quit + reopen it and rerun."
                         );
                     }
-                    let Some(asr) = ASR.get().cloned() else {
+                    let Some(asr) = ASR
+                        .get()
+                        .and_then(|slot| slot.read().ok()?.as_ref().cloned())
+                    else {
                         eprintln!("[whimpr] ASR not ready (model still loading or missing)");
                         finish();
                         return;
                     };
                     let pcm = whimpr_audio::resample_to_16k(&res.samples, res.sample_rate);
+                    let pcm = if let Some(vad) = VAD.get() {
+                        match vad.trim(&pcm) {
+                            Ok(trimmed) => {
+                                eprintln!(
+                                    "[whimpr] VAD kept {:.0}% of captured audio",
+                                    trimmed.len() as f64 / pcm.len().max(1) as f64 * 100.0
+                                );
+                                trimmed
+                            }
+                            Err(error) => {
+                                eprintln!("[whimpr] VAD failed, using full recording: {error}");
+                                pcm
+                            }
+                        }
+                    } else {
+                        pcm
+                    };
                     match asr.transcribe(&pcm) {
                         Ok(t) => {
                             let mut raw = t.text;
@@ -655,10 +705,15 @@ mod imp {
                             if !text.is_empty() {
                                 if let Err(e) = crate::paste::paste_text(&text) {
                                     eprintln!("[whimpr] paste failed: {e}");
+                                    let message = if e.to_string().contains("secure text fields") {
+                                        "Dictation is disabled in password fields"
+                                    } else {
+                                        "Couldn't insert text — check Accessibility"
+                                    };
                                     emit_bar_msg(
                                         &app2,
                                         "error",
-                                        Some("Couldn't paste — check Accessibility".into()),
+                                        Some(message.into()),
                                     );
                                 } else {
                                     record_dictation(&raw, &text, res.duration_secs());
@@ -809,26 +864,63 @@ mod imp {
         event
     }
 
+    /// Load the speech model after startup or a completed first-run download.
+    pub fn load_asr_model() {
+        if ASR_LOADING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::spawn(|| {
+            let mut engines: Vec<Arc<dyn AsrEngine>> = Vec::new();
+            let parakeet_path = crate::model_manager::parakeet_dir();
+            if parakeet_path.exists() {
+                match whimpr_asr::ParakeetEngine::load(&parakeet_path) {
+                    Ok(engine) => engines.push(Arc::new(engine)),
+                    Err(error) => {
+                        eprintln!("[whimpr] Parakeet load failed, trying Whisper: {error}");
+                    }
+                }
+            }
+            let whisper_path = model_path();
+            if whisper_path.exists() {
+                match whimpr_asr::WhisperEngine::load(&whisper_path) {
+                    Ok(engine) => engines.push(Arc::new(engine)),
+                    Err(error) => {
+                        eprintln!("[whimpr] Whisper ASR load failed: {error}");
+                    }
+                }
+            }
+            if engines.is_empty() {
+                eprintln!("[whimpr] no ASR model found");
+            } else if let Ok(fallback) = whimpr_asr::FallbackEngine::new(engines) {
+                let engine: Arc<dyn AsrEngine> = Arc::new(fallback);
+                let id = engine.id();
+                let slot = ASR.get_or_init(|| RwLock::new(None));
+                if let Ok(mut current) = slot.write() {
+                    *current = Some(engine);
+                }
+                eprintln!("[whimpr] ASR ready: {id:?}");
+            }
+
+            let vad_path = crate::model_manager::vad_path();
+            if VAD.get().is_none() && vad_path.exists() {
+                match whimpr_asr::SileroVadTrimmer::load(&vad_path) {
+                    Ok(vad) => {
+                        let _ = VAD.set(Arc::new(vad));
+                        eprintln!("[whimpr] Silero VAD ready");
+                    }
+                    Err(error) => eprintln!("[whimpr] Silero VAD load failed: {error}"),
+                }
+            }
+            ASR_LOADING.store(false, Ordering::SeqCst);
+        });
+    }
+
     pub fn install(app: AppHandle) {
         let _ = APP.set(app);
         let _ = MACHINE.set(Mutex::new(StateMachine::new()));
         let _ = CLOCK.set(Instant::now());
 
-        // Load the speech-to-text model off the main thread (it takes ~1s).
-        std::thread::spawn(|| {
-            let path = model_path();
-            if !path.exists() {
-                eprintln!("[whimpr] ASR model not found at {}", path.display());
-                return;
-            }
-            match whimpr_asr::WhisperEngine::load(&path) {
-                Ok(engine) => {
-                    let _ = ASR.set(Arc::new(engine));
-                    eprintln!("[whimpr] ASR model loaded — ready to transcribe");
-                }
-                Err(e) => eprintln!("[whimpr] ASR model load failed: {e}"),
-            }
-        });
+        load_asr_model();
 
         // Load settings + dictionary, and build cloud providers from stored keys.
         let settings = whimpr_core::Settings::load(&settings_path());
@@ -917,17 +1009,19 @@ mod imp {
         });
     }
 
-    /// True once the Whisper model is loaded into memory.
+    /// True once an ASR model is loaded into memory.
     pub fn asr_ready() -> bool {
-        ASR.get().is_some()
+        ASR.get()
+            .and_then(|slot| slot.read().ok().map(|engine| engine.is_some()))
+            .unwrap_or(false)
     }
 }
 
 #[cfg(target_os = "macos")]
 pub use imp::{
     asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
-    dictionary_learn, dictionary_remove, history, install, language_stats, rebuild_providers,
-    sessions_for_analysis, snippet_add, snippet_remove, snippets_list, stats_summary,
+    dictionary_learn, dictionary_remove, history, install, language_stats, load_asr_model,
+    rebuild_providers, sessions_for_analysis, snippet_add, snippet_remove, snippets_list, stats_summary,
     transform_remove, transform_upsert, transforms_list, update_settings,
 };
 
@@ -935,7 +1029,7 @@ pub use imp::{
 #[cfg(target_os = "windows")]
 pub use crate::win::{
     asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
-    dictionary_learn, dictionary_remove, history, install, rebuild_providers,
+    dictionary_learn, dictionary_remove, history, install, load_asr_model, rebuild_providers,
     sessions_for_analysis, stats_summary, update_settings,
 };
 
@@ -943,6 +1037,7 @@ pub use crate::win::{
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod other {
     pub fn install(_app: tauri::AppHandle) {}
+    pub fn load_asr_model() {}
     pub fn asr_ready() -> bool {
         false
     }
@@ -990,7 +1085,7 @@ mod other {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use other::{
     asr_ready, current_settings, delete_history, dictionary_add, dictionary_entries,
-    dictionary_learn, dictionary_remove, history, install, language_stats, rebuild_providers,
-    sessions_for_analysis, snippet_add, snippet_remove, snippets_list, stats_summary,
+    dictionary_learn, dictionary_remove, history, install, language_stats, load_asr_model,
+    rebuild_providers, sessions_for_analysis, snippet_add, snippet_remove, snippets_list, stats_summary,
     transform_remove, transform_upsert, transforms_list, update_settings,
 };

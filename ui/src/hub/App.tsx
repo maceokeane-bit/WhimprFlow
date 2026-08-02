@@ -15,11 +15,14 @@ import { ComingSoon } from "./ComingSoon";
 import type { IconName } from "./icons";
 import {
   getSettings,
+  getModelDownloadStatus,
   setSettings,
   getStatus,
+  type ModelDownloadStatus,
   type Settings,
   type Status,
   DEFAULT_SETTINGS,
+  EMPTY_MODEL_STATUS,
 } from "./api";
 
 // Placeholder screens that are routed but not yet built.
@@ -35,6 +38,7 @@ export function App() {
   const [page, setPage] = useState<Page>("home");
   const [settings, setLocalSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [entered, setEntered] = useState(false);
+  const [model, setModel] = useState<ModelDownloadStatus>(EMPTY_MODEL_STATUS);
   const [status, setStatus] = useState<Status>({
     accessibility: false,
     microphone: false,
@@ -43,7 +47,10 @@ export function App() {
     has_anthropic_key: false,
   });
 
-  const refresh = () => getStatus().then(setStatus);
+  const refresh = () => {
+    void getStatus().then(setStatus);
+    void getModelDownloadStatus().then(setModel);
+  };
 
   useEffect(() => {
     getSettings().then(setLocalSettings);
@@ -56,8 +63,15 @@ export function App() {
   };
 
   // Gate the app behind the setup wizard until the required permissions are granted.
-  if (!(status.accessibility && status.microphone) && !entered) {
-    return <Onboarding status={status} refresh={refresh} onEnter={() => setEntered(true)} />;
+  if (!(status.accessibility && status.microphone && model.state === "ready") && !entered) {
+    return (
+      <Onboarding
+        status={status}
+        model={model}
+        refresh={refresh}
+        onEnter={() => setEntered(true)}
+      />
+    );
   }
 
   const soon = SOON[page];

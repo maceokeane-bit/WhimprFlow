@@ -12,6 +12,7 @@ mod caret;
 mod hotkey;
 mod local_llm;
 mod media;
+mod model_manager;
 mod overlay;
 mod paste;
 mod insights;
@@ -25,10 +26,17 @@ use serde::Serialize;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
+use overlay::OVERLAY_LABEL;
+
 const HUB_LABEL: &str = "main";
+
+#[derive(Clone, Serialize)]
+struct BarStatePayload {
+    state: &'static str,
+}
 
 fn build_overlay(app: &tauri::App) -> tauri::Result<tauri::WebviewWindow> {
     overlay::build_overlay(app)
@@ -44,7 +52,13 @@ fn build_hub(app: &tauri::App) -> tauri::Result<WebviewWindow> {
 }
 
 fn emit_bar_state(app: &tauri::AppHandle, state: &'static str) {
-    overlay::emit_state(app, state, None);
+    overlay::present(app);
+    overlay::dispatch_state(app, state, None);
+    let _ = app.emit_to(
+        OVERLAY_LABEL,
+        "whimpr://flowbar/state",
+        BarStatePayload { state },
+    );
 }
 
 #[tauri::command]
@@ -279,6 +293,21 @@ fn get_services() -> services::ServicesStatus {
 }
 
 #[tauri::command]
+fn get_model_download_status(app: tauri::AppHandle) -> model_manager::ModelDownloadStatus {
+    model_manager::status(app)
+}
+
+#[tauri::command]
+fn start_model_download(app: tauri::AppHandle) -> Result<(), String> {
+    model_manager::start_download(app)
+}
+
+#[tauri::command]
+fn cancel_model_download() {
+    model_manager::cancel_download();
+}
+
+#[tauri::command]
 fn start_ollama() -> Result<(), String> {
     services::start_ollama()
 }
@@ -322,7 +351,17 @@ fn is_launch_at_login_enabled(app: tauri::AppHandle) -> Result<bool, String> {
 }
 
 pub fn run() {
-    let mut builder = tauri::Builder::default().plugin(tauri_plugin_autostart::Builder::new().build());
+    // Only one process may own the global hotkey and overlay. Multiple instances
+    // can otherwise stack identical pills while different processes receive Fn.
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(hub) = app.get_webview_window(HUB_LABEL) {
+                let _ = hub.show();
+                let _ = hub.set_focus();
+            }
+            overlay::present(app);
+        }))
+        .plugin(tauri_plugin_autostart::Builder::new().build());
     #[cfg(target_os = "macos")]
     {
         builder = builder.plugin(tauri_nspanel::init());
@@ -338,6 +377,9 @@ pub fn run() {
             remove_dictionary_entry,
             get_status,
             get_services,
+            get_model_download_status,
+            start_model_download,
+            cancel_model_download,
             start_ollama,
             pull_ollama_model,
             set_launch_at_login,
@@ -356,8 +398,7 @@ pub fn run() {
             request_microphone,
             request_accessibility,
             request_input_monitoring,
-            set_api_key,
-            overlay::get_overlay_snapshot
+            set_api_key
         ])
         .setup(|app| {
             // Regular app: shows in the Dock with a normal, focusable main window.
@@ -366,6 +407,7 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
             build_overlay(app)?;
+            overlay::start_monitor_follow(app.handle().clone());
             let hub = build_hub(app)?;
             let _ = hub.show();
             let _ = hub.set_focus();

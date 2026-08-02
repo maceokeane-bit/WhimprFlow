@@ -254,16 +254,16 @@ function ServicesCard({
 
   return (
     <Card style={{ marginBottom: 16 }}>
-      <SectionTitle sub="WhimprFlow loads Whisper when it starts. Ollama is a separate app — start it once, then leave it running.">
+      <SectionTitle sub="WhimprFlow prefers Parakeet and falls back to Whisper. Ollama is a separate app — start it once, then leave it running.">
         Services
       </SectionTitle>
       <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
         <ServiceRow
-          ok={!!services?.whisper_loaded}
-          label="Whisper (speech-to-text)"
+          ok={!!services?.asr_loaded}
+          label="On-device speech recognition"
           detail={
-            services?.whisper_model
-              ? `${services.whisper_model}${services.whisper_loaded ? " — loaded" : " — loading…"}`
+            services?.asr_model
+              ? `${services.asr_model}${services.asr_loaded ? " — loaded" : " — loading…"}`
               : "model file missing"
           }
         />

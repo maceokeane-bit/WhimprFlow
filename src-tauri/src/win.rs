@@ -388,6 +388,10 @@ pub fn asr_ready() -> bool {
     ASR.get().is_some()
 }
 
+/// Windows currently loads its engine during `install`; a completed first-run
+/// download is picked up on the next launch.
+pub fn load_asr_model() {}
+
 pub fn stats_summary(tz_offset_minutes: i32) -> StatsSummary {
     STATS
         .get()

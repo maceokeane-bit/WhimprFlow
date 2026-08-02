@@ -2,9 +2,12 @@ import { useEffect } from "react";
 import { font, palette } from "../tokens/values";
 import { theme } from "./theme";
 import {
+  cancelModelDownload,
   requestAccessibility,
   requestMicrophone,
   requestInputMonitoring,
+  startModelDownload,
+  type ModelDownloadStatus,
   type Status,
 } from "./api";
 
@@ -98,12 +101,130 @@ function Step({
   );
 }
 
+function ModelStep({ model, unlocked }: { model: ModelDownloadStatus; unlocked: boolean }) {
+  const ready = model.state === "ready";
+  const busy = model.state === "downloading" || model.state === "verifying";
+  const percent =
+    model.total_bytes > 0 ? Math.min(100, (model.downloaded_bytes / model.total_bytes) * 100) : 0;
+  const downloadedGb = (model.downloaded_bytes / 1_000_000_000).toFixed(1);
+  const totalGb = (model.total_bytes / 1_000_000_000).toFixed(1);
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 16,
+        padding: "16px 18px",
+        borderRadius: 14,
+        marginBottom: 12,
+        background: unlocked && !ready ? theme.accentSoft : theme.cardBg,
+        border: `1px solid ${unlocked && !ready ? theme.accentSoftBorder : theme.border}`,
+        boxShadow: theme.shadowSoft,
+        opacity: unlocked ? 1 : 0.5,
+      }}
+    >
+      <div
+        style={{
+          flex: "0 0 auto",
+          width: 30,
+          height: 30,
+          borderRadius: 9999,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontWeight: 700,
+          fontSize: 14,
+          color: ready ? "#fff" : theme.textMuted,
+          background: ready ? theme.accentDeep : theme.track,
+        }}
+      >
+        {ready ? "✓" : 4}
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 15, fontWeight: 600, color: theme.textStrong }}>
+          Speech model <span style={{ fontSize: 12, color: theme.textFaint, fontWeight: 400 }}>· required</span>
+        </div>
+        <div style={{ fontSize: 13, color: theme.textMuted, marginTop: 2 }}>
+          {ready
+            ? "Verified and ready for private, on-device transcription."
+            : model.state === "verifying"
+              ? "Verifying the existing model…"
+              : model.state === "downloading"
+                ? `Downloading ${downloadedGb} of ${totalGb} GB…`
+                : model.error ?? "Download Parakeet and voice detection for on-device transcription (0.7 GB)."}
+        </div>
+        {busy && (
+          <div
+            style={{
+              height: 5,
+              borderRadius: 999,
+              background: theme.track,
+              overflow: "hidden",
+              marginTop: 9,
+            }}
+          >
+            <div
+              style={{
+                height: "100%",
+                width: `${model.state === "verifying" ? 100 : percent}%`,
+                background: theme.accentDeep,
+                transition: "width 180ms ease",
+                opacity: model.state === "verifying" ? 0.55 : 1,
+              }}
+            />
+          </div>
+        )}
+      </div>
+      {!ready &&
+        (model.state === "downloading" ? (
+          <button
+            onClick={() => void cancelModelDownload()}
+            style={{
+              border: `1px solid ${theme.border}`,
+              borderRadius: 10,
+              padding: "9px 14px",
+              fontFamily: font.ui,
+              background: theme.cardBg,
+              color: theme.textBody,
+              cursor: "pointer",
+            }}
+          >
+            Cancel
+          </button>
+        ) : (
+          <button
+            onClick={() => void startModelDownload()}
+            disabled={!unlocked || model.state === "verifying"}
+            style={{
+              cursor: unlocked && model.state !== "verifying" ? "pointer" : "default",
+              border: "none",
+              borderRadius: 10,
+              padding: "9px 16px",
+              fontSize: 13,
+              fontWeight: 600,
+              fontFamily: font.ui,
+              color: "#fff",
+              background:
+                unlocked && model.state !== "verifying" ? palette.slate900 : theme.textFaint,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {model.state === "error" || model.state === "cancelled" ? "Retry" : "Download"}
+          </button>
+        ))}
+    </div>
+  );
+}
+
 export function Onboarding({
   status,
+  model,
   refresh,
   onEnter,
 }: {
   status: Status;
+  model: ModelDownloadStatus;
   refresh: () => void;
   onEnter: () => void;
 }) {
@@ -116,7 +237,7 @@ export function Onboarding({
   const acc = status.accessibility;
   const mic = status.microphone;
   const inp = status.input_monitoring;
-  const canEnter = acc && mic;
+  const canEnter = acc && mic && model.state === "ready";
 
   return (
     <div
@@ -187,6 +308,7 @@ export function Onboarding({
           required={false}
           onGrant={() => requestInputMonitoring()}
         />
+        <ModelStep model={model} unlocked={acc && mic} />
 
         <button
           onClick={onEnter}
@@ -205,7 +327,7 @@ export function Onboarding({
             background: canEnter ? theme.accentDeep : theme.textFaint,
           }}
         >
-          {canEnter ? "Enter WhimprFlow →" : "Grant Accessibility + Microphone to continue"}
+          {canEnter ? "Enter WhimprFlow →" : "Complete setup to continue"}
         </button>
 
         <p style={{ fontSize: 12, color: theme.textFaint, lineHeight: 1.5, marginTop: 16 }}>

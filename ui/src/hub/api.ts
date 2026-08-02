@@ -31,12 +31,12 @@ export type WritingStyle = "default" | "formal" | "casual" | "very_casual" | "ex
 export interface ServicesStatus {
   ollama_running: boolean;
   ollama_models: string[];
-  whisper_ready: boolean;
-  whisper_model: string | null;
+  asr_ready: boolean;
+  asr_model: string | null;
   gguf_ready: boolean;
   gguf_model: string | null;
   local_worker_ready: boolean;
-  whisper_loaded: boolean;
+  asr_loaded: boolean;
 }
 
 export interface Status {
@@ -46,6 +46,22 @@ export interface Status {
   has_openai_key: boolean;
   has_anthropic_key: boolean;
 }
+
+export interface ModelDownloadStatus {
+  state: "missing" | "verifying" | "downloading" | "ready" | "cancelled" | "error";
+  model: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+  error: string | null;
+}
+
+export const EMPTY_MODEL_STATUS: ModelDownloadStatus = {
+  state: "missing",
+  model: "Parakeet v3 + Silero VAD",
+  downloaded_bytes: 0,
+  total_bytes: 672_427_228,
+  error: null,
+};
 
 export interface StatsSummary {
   total_words: number;
@@ -122,6 +138,22 @@ export async function getStatus(): Promise<Status> {
       has_anthropic_key: false,
     };
   }
+}
+
+export async function getModelDownloadStatus(): Promise<ModelDownloadStatus> {
+  try {
+    return await invoke<ModelDownloadStatus>("get_model_download_status");
+  } catch {
+    return EMPTY_MODEL_STATUS;
+  }
+}
+
+export async function startModelDownload(): Promise<void> {
+  await invoke<void>("start_model_download");
+}
+
+export async function cancelModelDownload(): Promise<void> {
+  await invoke<void>("cancel_model_download");
 }
 
 export async function getStats(): Promise<StatsSummary> {

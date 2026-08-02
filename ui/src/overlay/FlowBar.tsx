@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type MutableRefObject } from "react";
+import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { palette, pillFill, geometry, font } from "../tokens/values";
 
 // Visual states, mirroring the Rust `BarState`.
@@ -13,65 +14,33 @@ export type BarState =
 
 type StateEvent = { state: BarState; message?: string };
 type WaveformEvent = { bars: number[] };
-
-type OverlaySnapshot = {
-  state: string;
-  message?: string | null;
-  bars: number[];
-};
-
-async function pollSnapshot(): Promise<OverlaySnapshot | null> {
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<OverlaySnapshot>("get_overlay_snapshot");
-  } catch {
-    return null;
-  }
-}
-
-function applySnapshot(
-  snap: OverlaySnapshot,
-  setState: (s: BarState) => void,
-  setMessage: (m: string | undefined) => void,
-  setBars: (b: number[]) => void,
-  transcribingSince: MutableRefObject<number | null>,
-  setSlow: (s: boolean) => void,
-) {
-  const next = snap.state as BarState;
-  setState(next);
-  setMessage(snap.message ?? undefined);
-  setBars(snap.bars);
-  if (next === "transcribing") {
-    transcribingSince.current = Date.now();
-    setSlow(false);
-  } else {
-    transcribingSince.current = null;
-    setSlow(false);
-  }
-}
+type OverlayBridgeWindow = Window &
+  typeof globalThis & {
+    __WHIMPR_OVERLAY_STATE__?: StateEvent;
+    __WHIMPR_OVERLAY_WAVEFORM__?: WaveformEvent;
+  };
 
 async function tauriListen<T>(event: string, cb: (payload: T) => void): Promise<() => void> {
-  try {
-    const { listen } = await import("@tauri-apps/api/event");
-    return await listen<T>(event, (e) => cb(e.payload as T));
-  } catch {
-    return () => {};
-  }
+  return listen<T>(event, (e) => cb(e.payload));
 }
 
 function Spinner() {
   return (
-    <div
-      style={{
-        width: 14,
-        height: 14,
-        borderRadius: "50%",
-        border: "2px solid rgba(255,255,255,0.18)",
-        borderTopColor: palette.accent500,
-        animation: "whimpr-spin 0.75s linear infinite",
-        flex: "0 0 auto",
-      }}
-    />
+    <div style={{ display: "flex", alignItems: "center", gap: 3, height: 20 }} aria-hidden="true">
+      {[0, 1, 2].map((index) => (
+        <span
+          key={index}
+          style={{
+            width: 3,
+            height: 13,
+            borderRadius: 999,
+            background: palette.accent400,
+            boxShadow: `0 0 8px ${palette.accentGlow}`,
+            animation: `whimpr-prepare 0.9s ease-in-out ${index * 0.12}s infinite`,
+          }}
+        />
+      ))}
+    </div>
   );
 }
 
@@ -80,6 +49,7 @@ function Spinner() {
 function DottedWaveform({ bars }: { bars: number[] }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const barsRef = useRef<number[]>(bars);
+  const displayedRef = useRef<number[]>(Array.from({ length: 16 }, () => 0));
   barsRef.current = bars;
 
   useEffect(() => {
@@ -104,10 +74,11 @@ function DottedWaveform({ bars }: { bars: number[] }) {
       const t = performance.now();
       ctx.fillStyle = palette.waveBar;
       for (let i = 0; i < N; i++) {
-        const real = barsRef.current[barsRef.current.length - 1 - (i % barsRef.current.length)];
-        const shimmer = 0.12 + 0.06 * Math.abs(Math.sin(t / 260 + i * 0.7));
-        const amp = Math.max(shimmer, real ?? 0);
-        const bh = 3 + amp * 20;
+        const target = Math.max(0, Math.min(1, barsRef.current[i] ?? 0));
+        displayedRef.current[i] += (target - displayedRef.current[i]) * 0.28;
+        const idleMotion = 0.08 + 0.04 * Math.abs(Math.sin(t / 260 + i * 0.7));
+        const amp = Math.max(idleMotion, displayedRef.current[i]);
+        const bh = 3 + amp * 22;
         const x = i * (dotW + gap);
         const y = (h - bh) / 2;
         ctx.beginPath();
@@ -187,45 +158,55 @@ export function FlowBar() {
   const [message, setMessage] = useState<string | undefined>();
   const [bars, setBars] = useState<number[]>([]);
   const [slow, setSlow] = useState(false);
-  const transcribingSince = useRef<number | null>(null);
 
   useEffect(() => {
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
-    tauriListen<StateEvent>("whimpr://flowbar/state", (p) => {
+
+    const applyState = (p: StateEvent) => {
       setState(p.state);
       setMessage(p.message);
-      if (p.state === "transcribing") {
-        transcribingSince.current = Date.now();
-        setSlow(false);
-      } else {
-        transcribingSince.current = null;
-        setSlow(false);
-      }
-    }).then((u) => (un1 = u));
-    tauriListen<WaveformEvent>("whimpr://audio/waveform", (p) => setBars(p.bars)).then((u) => (un2 = u));
-
-    // NSPanel webviews don't receive Tauri events reliably — poll Rust snapshot.
-    let alive = true;
-    const tick = async () => {
-      if (!alive) return;
-      const snap = await pollSnapshot();
-      if (snap) {
-        applySnapshot(snap, setState, setMessage, setBars, transcribingSince, setSlow);
-      }
     };
-    void tick();
-    const id = window.setInterval(tick, 33);
+    const applyWaveform = (p: WaveformEvent) => setBars(p.bars);
+    const onPanelState = (event: Event) =>
+      applyState((event as CustomEvent<StateEvent>).detail);
+    const onPanelWaveform = (event: Event) =>
+      applyWaveform((event as CustomEvent<WaveformEvent>).detail);
+
+    window.addEventListener("whimpr:overlay-state", onPanelState);
+    window.addEventListener("whimpr:overlay-waveform", onPanelWaveform);
+    tauriListen<StateEvent>("whimpr://flowbar/state", applyState).then((u) => (un1 = u));
+    tauriListen<WaveformEvent>("whimpr://audio/waveform", applyWaveform).then(
+      (u) => (un2 = u),
+    );
+
+    // Main-thread Rust injection also stores the latest payload globally. Polling
+    // these references avoids relying on NSPanel event propagation altogether.
+    const bridge = window as OverlayBridgeWindow;
+    let lastState = bridge.__WHIMPR_OVERLAY_STATE__;
+    let lastWaveform = bridge.__WHIMPR_OVERLAY_WAVEFORM__;
+    const bridgePoll = window.setInterval(() => {
+      if (bridge.__WHIMPR_OVERLAY_STATE__ !== lastState) {
+        lastState = bridge.__WHIMPR_OVERLAY_STATE__;
+        if (lastState) applyState(lastState);
+      }
+      if (bridge.__WHIMPR_OVERLAY_WAVEFORM__ !== lastWaveform) {
+        lastWaveform = bridge.__WHIMPR_OVERLAY_WAVEFORM__;
+        if (lastWaveform) applyWaveform(lastWaveform);
+      }
+    }, 16);
 
     return () => {
-      alive = false;
-      window.clearInterval(id);
+      window.clearInterval(bridgePoll);
+      window.removeEventListener("whimpr:overlay-state", onPanelState);
+      window.removeEventListener("whimpr:overlay-waveform", onPanelWaveform);
       un1?.();
       un2?.();
     };
   }, []);
 
   useEffect(() => {
+    setSlow(false);
     if (state !== "transcribing") return;
     const id = window.setTimeout(() => setSlow(true), 4000);
     return () => window.clearTimeout(id);
@@ -239,8 +220,8 @@ export function FlowBar() {
     message ??
     (processing
       ? slow
-        ? "Taking longer than usual…"
-        : "Cleaning up…"
+        ? "Still preparing your text…"
+        : "Preparing your text…"
       : isError
         ? "Something's off"
         : state === "cancelled"
@@ -254,7 +235,9 @@ export function FlowBar() {
     : recording
       ? { w: 250, h: 44 }
       : processing && slow
-        ? { w: 220, h: 36 }
+        ? { w: 230, h: 38 }
+        : processing
+          ? { w: 205, h: 38 }
         : isError
           ? { w: 210, h: 36 }
           : { w: 180, h: 36 };
@@ -268,7 +251,10 @@ export function FlowBar() {
   return (
     <>
       <style>{`
-        @keyframes whimpr-spin { to { transform: rotate(360deg); } }
+        @keyframes whimpr-prepare {
+          0%, 100% { opacity: 0.35; transform: scaleY(0.45); }
+          50% { opacity: 1; transform: scaleY(1); }
+        }
         @keyframes whimpr-pulse {
           0%, 100% { opacity: 0.55; transform: scale(0.92); }
           50% { opacity: 1; transform: scale(1); }
@@ -294,7 +280,7 @@ export function FlowBar() {
             gap: 10,
             height: dims.h,
             width: dims.w,
-            padding: recording ? "0 8px" : processing || isError ? "0 14px" : 0,
+            padding: recording ? "0 8px" : processing || isError ? "0 16px" : 0,
             background: pillFill.base,
             border: `1px solid ${borderColor}`,
             borderRadius: 9999,
