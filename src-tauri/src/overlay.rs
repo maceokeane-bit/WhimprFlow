@@ -28,6 +28,8 @@ const WAVEFORM_EVAL_MIN: Duration = Duration::from_millis(33);
 
 static FOLLOW_STARTED: AtomicBool = AtomicBool::new(false);
 static VISIBLE: AtomicBool = AtomicBool::new(true);
+static CLICK_TAP_STARTED: AtomicBool = AtomicBool::new(false);
+static LAST_CLICKED_POINT: OnceLock<Mutex<Option<(f64, f64)>>> = OnceLock::new();
 static LAST_CLICKED_MONITOR: OnceLock<Mutex<Option<(i32, i32)>>> = OnceLock::new();
 static LAST_TARGET_MONITOR: OnceLock<Mutex<Option<(i32, i32)>>> = OnceLock::new();
 static LAST_FRONTMOST_FRAME: OnceLock<Mutex<Option<(i32, i32, i32, i32)>>> = OnceLock::new();
@@ -162,19 +164,17 @@ pub fn start_monitor_follow(app: AppHandle) {
             );
         }
     }
-    let mut mouse_was_down = mouse_buttons_down();
+    start_click_monitor();
     std::thread::spawn(move || loop {
         std::thread::sleep(FOLLOW_INTERVAL);
         let app_for_task = app.clone();
-        let mouse_is_down = mouse_buttons_down();
-        let clicked = mouse_is_down && !mouse_was_down;
-        mouse_was_down = mouse_is_down;
+        let clicked_point = take_clicked_point();
         if app
             .run_on_main_thread(move || {
                 if VISIBLE.load(Ordering::SeqCst) {
                     if let Some(window) = overlay_window(&app_for_task) {
-                        if clicked {
-                            remember_clicked_monitor(&app_for_task);
+                        if let Some((x, y)) = clicked_point {
+                            remember_clicked_monitor(&app_for_task, x, y);
                         }
                         reposition_on_active_monitor(&app_for_task, &window, false);
                     }
@@ -392,12 +392,13 @@ fn monitor_by_key(app: &AppHandle, key: (i32, i32)) -> Option<Monitor> {
         .find(|monitor| monitor_key(monitor) == key)
 }
 
-fn remember_clicked_monitor(app: &AppHandle) {
-    let Some(monitor) = app.cursor_position().ok().and_then(|position| {
-        app.monitor_from_point(position.x, position.y)
-            .ok()
-            .flatten()
-    }) else {
+fn remember_clicked_monitor(app: &AppHandle, x: f64, y: f64) {
+    let Some(monitor) = app
+        .monitor_from_point(x, y)
+        .ok()
+        .flatten()
+        .or_else(|| monitor_containing_logical_point(app, x, y))
+    else {
         return;
     };
     let key = monitor_key(&monitor);
@@ -405,7 +406,7 @@ fn remember_clicked_monitor(app: &AppHandle) {
     if let Ok(mut previous) = target.lock() {
         if *previous != Some(key) {
             eprintln!(
-                "[whimpr] clicked monitor -> {:?} @({}, {})",
+                "[whimpr] clicked monitor -> {:?} @({}, {}) from ({x:.1}, {y:.1})",
                 monitor.name(),
                 key.0,
                 key.1
@@ -449,22 +450,121 @@ fn active_monitor(app: &AppHandle) -> Option<Monitor> {
 }
 
 #[cfg(target_os = "macos")]
-fn mouse_buttons_down() -> bool {
-    const COMBINED_SESSION_STATE: i32 = 0;
-    extern "C" {
-        fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
-    }
-    unsafe {
-        CGEventSourceButtonState(COMBINED_SESSION_STATE, 0)
-            || CGEventSourceButtonState(COMBINED_SESSION_STATE, 1)
-            || CGEventSourceButtonState(COMBINED_SESSION_STATE, 2)
-    }
+fn clicked_point_slot() -> &'static Mutex<Option<(f64, f64)>> {
+    LAST_CLICKED_POINT.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_os = "macos")]
+fn take_clicked_point() -> Option<(f64, f64)> {
+    clicked_point_slot().lock().ok()?.take()
 }
 
 #[cfg(not(target_os = "macos"))]
-fn mouse_buttons_down() -> bool {
-    false
+fn take_clicked_point() -> Option<(f64, f64)> {
+    None
 }
+
+#[cfg(target_os = "macos")]
+fn start_click_monitor() {
+    use std::os::raw::c_void;
+    use std::ptr::{null, null_mut};
+
+    type CFMachPortRef = *mut c_void;
+    type CFRunLoopSourceRef = *mut c_void;
+    type CFRunLoopRef = *mut c_void;
+    type CFStringRef = *const c_void;
+    type CFAllocatorRef = *const c_void;
+    type CGEventRef = *mut c_void;
+    type CGEventTapProxy = *mut c_void;
+    type CGEventTapCallBack =
+        extern "C" fn(CGEventTapProxy, u32, CGEventRef, *mut c_void) -> CGEventRef;
+
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventTapCreate(
+            tap: u32,
+            place: u32,
+            options: u32,
+            events_of_interest: u64,
+            callback: CGEventTapCallBack,
+            user_info: *mut c_void,
+        ) -> CFMachPortRef;
+        fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFMachPortCreateRunLoopSource(
+            allocator: CFAllocatorRef,
+            port: CFMachPortRef,
+            order: isize,
+        ) -> CFRunLoopSourceRef;
+        fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+        fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+        fn CFRunLoopRun();
+        static kCFRunLoopDefaultMode: CFStringRef;
+    }
+
+    const K_CG_SESSION_EVENT_TAP: u32 = 1;
+    const K_CG_HEAD_INSERT: u32 = 0;
+    const K_CG_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+    const K_CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+    const K_CG_EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
+    const K_CG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
+    const EVENTS_OF_INTEREST: u64 = (1 << K_CG_EVENT_LEFT_MOUSE_DOWN)
+        | (1 << K_CG_EVENT_RIGHT_MOUSE_DOWN)
+        | (1 << K_CG_EVENT_OTHER_MOUSE_DOWN);
+
+    extern "C" fn callback(
+        _proxy: CGEventTapProxy,
+        _event_type: u32,
+        event: CGEventRef,
+        _user_info: *mut c_void,
+    ) -> CGEventRef {
+        unsafe {
+            let point = CGEventGetLocation(event);
+            if let Ok(mut clicked) = clicked_point_slot().lock() {
+                *clicked = Some((point.x, point.y));
+            }
+        }
+        event
+    }
+
+    if CLICK_TAP_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    std::thread::spawn(move || unsafe {
+        let tap = CGEventTapCreate(
+            K_CG_SESSION_EVENT_TAP,
+            K_CG_HEAD_INSERT,
+            K_CG_TAP_OPTION_LISTEN_ONLY,
+            EVENTS_OF_INTEREST,
+            callback,
+            null_mut(),
+        );
+        if tap.is_null() {
+            eprintln!("[whimpr] click monitor tap unavailable");
+            return;
+        }
+        let source = CFMachPortCreateRunLoopSource(null(), tap, 0);
+        if source.is_null() {
+            eprintln!("[whimpr] click monitor runloop source unavailable");
+            return;
+        }
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+        CFRunLoopRun();
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_click_monitor() {}
 
 /// Top-center of `monitor`, inset below the menu bar / notch divot.
 fn top_center_on_monitor(monitor: &Monitor, width: f64) -> (f64, f64) {
