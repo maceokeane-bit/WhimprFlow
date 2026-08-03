@@ -28,6 +28,7 @@ const WAVEFORM_EVAL_MIN: Duration = Duration::from_millis(33);
 
 static FOLLOW_STARTED: AtomicBool = AtomicBool::new(false);
 static VISIBLE: AtomicBool = AtomicBool::new(true);
+static LAST_CLICKED_MONITOR: OnceLock<Mutex<Option<(i32, i32)>>> = OnceLock::new();
 static LAST_TARGET_MONITOR: OnceLock<Mutex<Option<(i32, i32)>>> = OnceLock::new();
 static LAST_FRONTMOST_FRAME: OnceLock<Mutex<Option<(i32, i32, i32, i32)>>> = OnceLock::new();
 static SNAP: OnceLock<Mutex<FlowBarSnap>> = OnceLock::new();
@@ -161,13 +162,20 @@ pub fn start_monitor_follow(app: AppHandle) {
             );
         }
     }
+    let mut mouse_was_down = mouse_buttons_down();
     std::thread::spawn(move || loop {
         std::thread::sleep(FOLLOW_INTERVAL);
         let app_for_task = app.clone();
+        let mouse_is_down = mouse_buttons_down();
+        let clicked = mouse_is_down && !mouse_was_down;
+        mouse_was_down = mouse_is_down;
         if app
             .run_on_main_thread(move || {
                 if VISIBLE.load(Ordering::SeqCst) {
                     if let Some(window) = overlay_window(&app_for_task) {
+                        if clicked {
+                            remember_clicked_monitor(&app_for_task);
+                        }
                         reposition_on_active_monitor(&app_for_task, &window, false);
                     }
                 }
@@ -308,7 +316,7 @@ fn present_on(app: &AppHandle, w: &WebviewWindow) {
 
 #[cfg(target_os = "macos")]
 fn raise_native(w: &WebviewWindow) {
-    use objc2_app_kit::{NSStatusWindowLevel, NSWindow};
+    use objc2_app_kit::{NSScreenSaverWindowLevel, NSWindow, NSWindowCollectionBehavior};
     let Ok(ptr) = w.ns_window() else {
         return;
     };
@@ -318,7 +326,13 @@ fn raise_native(w: &WebviewWindow) {
     // SAFETY: Tauri owns this NSWindow for the lifetime of the WebviewWindow.
     unsafe {
         let ns_window = &*(ptr as *const NSWindow);
-        ns_window.setLevel(NSStatusWindowLevel);
+        let behavior = ns_window.collectionBehavior()
+            | NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary
+            | NSWindowCollectionBehavior::Stationary
+            | NSWindowCollectionBehavior::IgnoresCycle;
+        ns_window.setCollectionBehavior(behavior);
+        ns_window.setLevel(NSScreenSaverWindowLevel);
         ns_window.orderFrontRegardless();
     }
 }
@@ -367,40 +381,89 @@ fn monitor_containing_logical_point(app: &AppHandle, x: f64, y: f64) -> Option<M
     })
 }
 
-/// Prefer the frontmost app's window, then the cursor, then the primary display.
-fn active_monitor(app: &AppHandle) -> Option<Monitor> {
-    if let Some(frame) = crate::caret::frontmost_window_frame() {
-        let frame_key = (
-            frame.x.round() as i32,
-            frame.y.round() as i32,
-            frame.width.round() as i32,
-            frame.height.round() as i32,
-        );
-        let previous = LAST_FRONTMOST_FRAME.get_or_init(|| Mutex::new(None));
-        let mut previous = previous.lock().unwrap();
-        if *previous != Some(frame_key) {
+fn monitor_key(monitor: &Monitor) -> (i32, i32) {
+    (monitor.position().x, monitor.position().y)
+}
+
+fn monitor_by_key(app: &AppHandle, key: (i32, i32)) -> Option<Monitor> {
+    app.available_monitors()
+        .ok()?
+        .into_iter()
+        .find(|monitor| monitor_key(monitor) == key)
+}
+
+fn remember_clicked_monitor(app: &AppHandle) {
+    let Some(monitor) = app.cursor_position().ok().and_then(|position| {
+        app.monitor_from_point(position.x, position.y)
+            .ok()
+            .flatten()
+    }) else {
+        return;
+    };
+    let key = monitor_key(&monitor);
+    let target = LAST_CLICKED_MONITOR.get_or_init(|| Mutex::new(None));
+    if let Ok(mut previous) = target.lock() {
+        if *previous != Some(key) {
             eprintln!(
-                "[whimpr] frontmost frame -> ({}, {}) {}x{}",
-                frame_key.0, frame_key.1, frame_key.2, frame_key.3
+                "[whimpr] clicked monitor -> {:?} @({}, {})",
+                monitor.name(),
+                key.0,
+                key.1
             );
-            *previous = Some(frame_key);
-        }
-        drop(previous);
-        let (x, y) = crate::caret::rect_center(frame);
-        if let Some(monitor) = monitor_containing_logical_point(app, x, y) {
-            return Some(monitor);
+            *previous = Some(key);
         }
     }
+}
 
-    app.cursor_position()
-        .ok()
-        .and_then(|position| {
-            app.monitor_from_point(position.x, position.y)
-                .ok()
-                .flatten()
+/// Prefer the screen last clicked by the user, then frontmost app, then primary display.
+fn active_monitor(app: &AppHandle) -> Option<Monitor> {
+    LAST_CLICKED_MONITOR
+        .get()
+        .and_then(|target| target.lock().ok().and_then(|key| *key))
+        .and_then(|key| monitor_by_key(app, key))
+        .or_else(|| {
+            if let Some(frame) = crate::caret::frontmost_window_frame() {
+                let frame_key = (
+                    frame.x.round() as i32,
+                    frame.y.round() as i32,
+                    frame.width.round() as i32,
+                    frame.height.round() as i32,
+                );
+                let previous = LAST_FRONTMOST_FRAME.get_or_init(|| Mutex::new(None));
+                let mut previous = previous.lock().unwrap();
+                if *previous != Some(frame_key) {
+                    eprintln!(
+                        "[whimpr] frontmost frame -> ({}, {}) {}x{}",
+                        frame_key.0, frame_key.1, frame_key.2, frame_key.3
+                    );
+                    *previous = Some(frame_key);
+                }
+                drop(previous);
+                let (x, y) = crate::caret::rect_center(frame);
+                return monitor_containing_logical_point(app, x, y);
+            }
+            None
         })
         .or_else(|| app.primary_monitor().ok().flatten())
         .or_else(|| app.available_monitors().ok()?.into_iter().next())
+}
+
+#[cfg(target_os = "macos")]
+fn mouse_buttons_down() -> bool {
+    const COMBINED_SESSION_STATE: i32 = 0;
+    extern "C" {
+        fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
+    }
+    unsafe {
+        CGEventSourceButtonState(COMBINED_SESSION_STATE, 0)
+            || CGEventSourceButtonState(COMBINED_SESSION_STATE, 1)
+            || CGEventSourceButtonState(COMBINED_SESSION_STATE, 2)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mouse_buttons_down() -> bool {
+    false
 }
 
 /// Top-center of `monitor`, inset below the menu bar / notch divot.
