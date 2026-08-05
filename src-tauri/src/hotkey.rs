@@ -1017,11 +1017,14 @@ mod imp {
                 if current_settings().sound_on_start {
                     crate::sound::play_stop_ping();
                 }
-                if current_settings().pause_media_while_dictating {
-                    let _ = app.run_on_main_thread(|| {
-                        crate::media::on_dictation_stop();
-                    });
-                }
+                // Always call on_dictation_stop (it no-ops when nothing was paused) so
+                // every pause is paired with a resume. This prevents a stale flag from a
+                // prior interrupted/setting-toggled session from unpausing audio you
+                // didn't have playing this time — resume only ever targets what THIS
+                // session paused, i.e. what was actively playing.
+                let _ = app.run_on_main_thread(|| {
+                    crate::media::on_dictation_stop();
+                });
                 let app2 = app.clone();
                 let handle = CAPTURE.get().and_then(|slot| slot.lock().unwrap().take());
                 std::thread::spawn(move || {
@@ -1169,11 +1172,10 @@ mod imp {
             }
             Action::DiscardCapture { .. } => {
                 PREVIEW_GEN.fetch_add(1, Ordering::SeqCst);
-                if current_settings().pause_media_while_dictating {
-                    let _ = app.run_on_main_thread(|| {
-                        crate::media::on_dictation_stop();
-                    });
-                }
+                // Always pair the resume with a pause — see StopCaptureAndFinalize.
+                let _ = app.run_on_main_thread(|| {
+                    crate::media::on_dictation_stop();
+                });
                 if let Some(slot) = CAPTURE.get() {
                     if let Some(handle) = slot.lock().unwrap().take() {
                         let _ = handle.stop();
@@ -1668,30 +1670,46 @@ mod imp {
         // tap's privilege at CGEventTapCreate time — a tap born untrusted is
         // permanently frontmost-only and is NOT upgraded when the grant later arrives.
         // Polling here also means the Fn key starts working the moment the user grants
-        // Accessibility, without a relaunch.
+        // Accessibility, without a relaunch. The create loop additionally self-heals:
+        // a few quick retries ride out TCC-settling transients right after the grant,
+        // and if the entry is stale (e.g. from an earlier build) it waits for a trust
+        // cycle (`tccutil reset` -> revoke -> re-grant) and rebuilds — no relaunch.
         std::thread::spawn(|| {
-            while !crate::paste::is_trusted() {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            eprintln!("[whimpr] Accessibility present — creating global PTT tap");
-            let port = unsafe {
-                CGEventTapCreate(
-                    K_CG_SESSION_EVENT_TAP,
-                    K_CG_HEAD_INSERT,
-                    K_CG_TAP_OPTION_DEFAULT,
-                    EVENTS_OF_INTEREST,
-                    tap_callback,
-                    null_mut(),
-                )
-            };
-            if port.is_null() {
+            let port = 'create: loop {
+                while !crate::paste::is_trusted() {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                eprintln!("[whimpr] Accessibility present — creating global PTT tap");
+                for attempt in 0..5u32 {
+                    if attempt > 0 {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    let p = unsafe {
+                        CGEventTapCreate(
+                            K_CG_SESSION_EVENT_TAP,
+                            K_CG_HEAD_INSERT,
+                            K_CG_TAP_OPTION_DEFAULT,
+                            EVENTS_OF_INTEREST,
+                            tap_callback,
+                            null_mut(),
+                        )
+                    };
+                    if !p.is_null() {
+                        break 'create p;
+                    }
+                }
                 eprintln!(
                     "[whimpr] Fn tap null despite Accessibility — likely a stale TCC entry from \
                      an earlier build. Run: tccutil reset Accessibility com.whimpr.whimprflow, \
-                     then re-grant and relaunch."
+                     then re-grant; the tap rebuilds once trust is re-established (no relaunch \
+                     needed)."
                 );
-                return;
-            }
+                // Wait for the stale trust to be revoked (tccutil reset) before retrying, so
+                // we don't hammer CGEventTapCreate on a permanently-stale entry.
+                while crate::paste::is_trusted() {
+                    std::thread::sleep(Duration::from_millis(1000));
+                }
+            };
             TAP_PORT.store(port, Ordering::SeqCst);
             unsafe {
                 let source = CFMachPortCreateRunLoopSource(null(), port, 0);

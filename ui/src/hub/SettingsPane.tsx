@@ -725,7 +725,8 @@ export function SettingsPane({
               Pause media while dictating
             </div>
             <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2 }}>
-              Pauses Spotify, Music, and browser video when you start recording; resumes when you stop.
+              Pauses whatever is playing (Spotify, Music, YouTube, or any now-playing app) when you
+              start recording; resumes only what it paused when you stop. Never launches apps.
             </div>
           </div>
           <Segmented

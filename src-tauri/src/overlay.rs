@@ -33,6 +33,10 @@ static LAST_FRONTMOST_FRAME: OnceLock<Mutex<Option<(i32, i32, i32, i32)>>> = Onc
 static SNAP: OnceLock<Mutex<FlowBarSnap>> = OnceLock::new();
 static SNAP_EPOCH: AtomicU64 = AtomicU64::new(1);
 static LAST_WAVE_EVAL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+/// Last window dims we actually applied. Suppresses redundant `set_size`
+/// calls so streaming partials — which never change dims after the first
+/// preview lands — don't pound the webview.
+static LAST_DIMS: OnceLock<Mutex<(f64, f64)>> = OnceLock::new();
 
 /// Latest Flow Bar UI payload — polled by the overlay webview.
 #[derive(Debug, Clone, Serialize)]
@@ -69,12 +73,80 @@ pub fn snapshot() -> FlowBarSnap {
     snap_slot().lock().map(|s| s.clone()).unwrap_or_default()
 }
 
+/// Logical pill dimensions for a given snap, mirroring `dims` in `FlowBar.tsx`.
+/// Kept in Rust so the overlay window can be sized to the visible pill — the
+/// transparent margin around it then never steals clicks. `OVERLAY_W/H` act as a
+/// safety ceiling.
+fn dims_for_snap(snap: &FlowBarSnap) -> (f64, f64) {
+    let state = snap.state.as_str();
+    let recording = matches!(state, "recording" | "locked" | "listening");
+    let processing = matches!(state, "transcribing" | "formatting" | "processing");
+    let preview_present = !snap.preview.trim().is_empty();
+    let (w, h): (f64, f64) = if state == "idle" {
+        (72.0, 18.0)
+    } else if recording && preview_present {
+        (340.0, 58.0)
+    } else if recording {
+        (260.0, 44.0)
+    } else if processing {
+        (168.0, 36.0)
+    } else if state == "error" {
+        let text = snap
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Something's not right");
+        let w = (text.chars().count() as f64 * 7.0 + 40.0).clamp(180.0, 280.0);
+        (w, 36.0)
+    } else {
+        (140.0, 34.0)
+    };
+    (w.min(OVERLAY_W), h.min(OVERLAY_H))
+}
+
+/// Resize + recenter the overlay to match the current pill dims. Called only on
+/// state transitions (and partial/waveform promotions), so `set_size` fires a
+/// handful of times per dictation cycle — never on the 250 ms follow loop,
+/// which is what froze the webview in earlier revisions. No-op when the dims
+/// haven't changed since the last apply.
+fn sync_geometry(app: &AppHandle) {
+    if !VISIBLE.load(Ordering::SeqCst) {
+        return;
+    }
+    let (w, h) = dims_for_snap(&snapshot());
+    let slot = LAST_DIMS.get_or_init(|| Mutex::new((0.0, 0.0)));
+    {
+        let mut last = slot.lock().unwrap();
+        if *last == (w, h) {
+            return;
+        }
+        *last = (w, h);
+    }
+    let app = app.clone();
+    let app_for_task = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || {
+        let Some(window) = overlay_window(&app_for_task) else {
+            return;
+        };
+        if let Some(monitor) = active_monitor(&app_for_task) {
+            let (x, y) = top_center_on_monitor(&monitor, w);
+            let _ = window.set_position(Position::Logical(LogicalPosition { x, y }));
+        }
+        let _ = window.set_size(tauri::Size::Logical(LogicalSize { width: w, height: h }));
+    }) {
+        eprintln!("[whimpr] overlay geometry schedule failed: {e}");
+    }
+}
+
 pub fn build_overlay(app: &tauri::App) -> tauri::Result<WebviewWindow> {
-    let (x, y) = overlay_position(app.handle(), OVERLAY_W, OVERLAY_H).unwrap_or((200.0, 200.0));
+    // Start at the idle pill dims; `present_on` corrects to the current snap.
+    let (iw, ih) = (72.0, 18.0);
+    let (x, y) = overlay_position(app.handle(), iw, ih).unwrap_or((200.0, 200.0));
     let mut builder =
         WebviewWindowBuilder::new(app, OVERLAY_LABEL, WebviewUrl::App("overlay.html".into()))
             .title("WhimprBar")
-            .inner_size(OVERLAY_W, OVERLAY_H)
+            .inner_size(iw, ih)
             .position(x, y)
             .decorations(false)
             .transparent(true)
@@ -190,6 +262,7 @@ pub fn dispatch_state(app: &AppHandle, state: &str, message: Option<String>) {
             snap.bars = vec![0.0; 16];
         }
     }
+    sync_geometry(app);
     let payload = serde_json::json!({ "state": state, "message": message, "epoch": epoch });
     let _ = app.emit(OVERLAY_LABEL_EVENT_STATE, &payload);
     let _ = app.emit_to(OVERLAY_LABEL, OVERLAY_LABEL_EVENT_STATE, &payload);
@@ -206,6 +279,7 @@ pub fn dispatch_waveform(app: &AppHandle, bars: &[f32]) {
             snap.message = None;
         }
     }
+    sync_geometry(app);
 
     let payload = serde_json::json!({ "bars": bars });
     // Always emit Tauri events (cheap). Rate-limit only the heavier DOM eval.
@@ -237,6 +311,7 @@ pub fn dispatch_partial(app: &AppHandle, text: &str) {
             snap.state = "recording".into();
         }
     }
+    sync_geometry(app);
     let payload = serde_json::json!({ "text": trimmed });
     let _ = app.emit(OVERLAY_LABEL_EVENT_PARTIAL, &payload);
     let _ = app.emit_to(OVERLAY_LABEL, OVERLAY_LABEL_EVENT_PARTIAL, &payload);
@@ -348,12 +423,16 @@ fn reposition_on_active_monitor(app: &AppHandle, window: &WebviewWindow, force: 
     }
     drop(previous);
 
-    let (x, y) = top_center_on_monitor(&monitor, OVERLAY_W);
+    let (w, h) = dims_for_snap(&snapshot());
+    let (x, y) = top_center_on_monitor(&monitor, w);
     let _ = window.set_position(Position::Logical(LogicalPosition { x, y }));
-    let _ = window.set_size(tauri::Size::Logical(LogicalSize {
-        width: OVERLAY_W,
-        height: OVERLAY_H,
-    }));
+    let _ = window.set_size(tauri::Size::Logical(LogicalSize { width: w, height: h }));
+    if let Ok(mut last) = LAST_DIMS
+        .get_or_init(|| Mutex::new((0.0, 0.0)))
+        .lock()
+    {
+        *last = (w, h);
+    }
 }
 
 fn monitor_containing_logical_point(app: &AppHandle, x: f64, y: f64) -> Option<Monitor> {
