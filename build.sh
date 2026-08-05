@@ -22,8 +22,13 @@ fi
 echo "Building release app bundle…"
 ui/node_modules/.bin/tauri build --bundles app,dmg
 
-APP="src-tauri/target/release/bundle/macos/WhimprFlow.app"
-DMG="src-tauri/target/release/bundle/dmg/WhimprFlow_"*.dmg
+APP="target/release/bundle/macos/WhimprFlow.app"
+DMG="target/release/bundle/dmg/WhimprFlow_"*.dmg
+
+if [ -d "$APP" ]; then
+  echo "Applying stable ad-hoc app signature…"
+  codesign --force --deep --sign - --entitlements src-tauri/Entitlements.plist "$APP"
+fi
 
 echo ""
 echo "✓ Built: $APP"
